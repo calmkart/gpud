@@ -20,7 +20,6 @@ import (
 	"google.golang.org/grpc/status"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 
-	componentkubelet "github.com/leptonai/gpud/components/kubelet"
 	pkgfile "github.com/leptonai/gpud/pkg/file"
 )
 
@@ -170,6 +169,39 @@ func TestCheckContainerdRunning_ConnectErrorWithMockey(t *testing.T) {
 	})
 }
 
+func TestCheckCRIORunning_WithMockey(t *testing.T) {
+	srv := &fakeRuntimeServer{
+		version: "1.30.3",
+	}
+	endpoint, cleanup := startFakeRuntimeServer(t, srv)
+	t.Cleanup(cleanup)
+
+	addr, err := parseUnixEndpoint(endpoint)
+	require.NoError(t, err)
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithContextDialer(dialUnix))
+	require.NoError(t, err)
+
+	mockey.PatchConvey("CheckCRIORunning returns true when the CRI-O endpoint answers", t, func() {
+		mockey.Mock(connect).To(func(_ context.Context, _ string) (*grpc.ClientConn, error) {
+			return conn, nil
+		}).Build()
+
+		assert.True(t, CheckCRIORunning(context.Background()))
+	})
+}
+
+func TestCheckCRIORunning_ConnectErrorWithMockey(t *testing.T) {
+	mockey.PatchConvey("CheckCRIORunning returns false on connect error", t, func() {
+		// the missing-socket path is the common one: on a node without CRI-O,
+		// connect fails its os.Stat pre-check and CheckCRIORunning must say
+		// "not running" so the containerd failure logic stays in charge
+		mockey.Mock(connect).To(func(_ context.Context, _ string) (*grpc.ClientConn, error) {
+			return nil, errors.New("socket file does not exist: /run/crio/crio.sock")
+		}).Build()
+		assert.False(t, CheckCRIORunning(context.Background()))
+	})
+}
+
 func TestCheckSocketExists_WithMockey(t *testing.T) {
 	mockey.PatchConvey("CheckSocketExists respects Stat results", t, func() {
 		tempFile, err := os.CreateTemp("", "containerd-sock")
@@ -217,21 +249,12 @@ func TestGetVersionFromCli_WithMockey(t *testing.T) {
 	})
 }
 
-func TestComponentMethodsAndDanglingPods(t *testing.T) {
+func TestComponentMethods(t *testing.T) {
 	comp := &component{}
 	assert.True(t, comp.IsSupported())
 
 	cr := &checkResult{}
 	assert.Equal(t, Name, cr.ComponentName())
-
-	kubeletPods := []componentkubelet.PodStatus{
-		{Name: "pod", Namespace: "default"},
-	}
-	containerdPods := []PodSandbox{
-		{Name: "pod", Namespace: "default", State: "SANDBOX_READY"},
-		{Name: "dangling", Namespace: "default", State: "SANDBOX_READY"},
-	}
-	assert.Equal(t, 1, danglingPodCount(containerdPods, kubeletPods))
 }
 
 func TestConnectAndCreateClientWithFakeRuntimeServer(t *testing.T) {

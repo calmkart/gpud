@@ -133,6 +133,22 @@ gpud:
   lsblkCommands: "nsenter --target 1 --mount -- lsblk"
   blockdevUsageCommands: "nsenter --target 1 --mount -- df"
 
+  # BYOK: root of the node filesystem used only when an NFS check is configured
+  # for this machine. This is NOT an NFS mount path and does NOT require paths
+  # such as /mnt/nfs-share to exist on every node. The control plane still sends
+  # each machine only its node-group-specific NFS paths. A machine with no NFS
+  # config performs no NFS path check; a configured machine whose mount is
+  # missing keeps gpud running and reports that NFS check as degraded.
+  #
+  # /proc/1/root exposes the node filesystem because this chart uses hostPID=true
+  # and runs gpud as privileged root. Using it avoids a hostPath volume for every
+  # possible node-group mount and therefore avoids blocking pod startup on nodes
+  # where another node group's path does not exist. Set this to "" only when the
+  # configured NFS paths are already visible in the container mount namespace.
+  # This Helm-only default does not affect systemd installations; the gpud CLI
+  # default is empty and preserves direct host-path behavior there.
+  nfsHostRoot: "/proc/1/root"
+
   # Command used by the containerd component to check whether the containerd
   # service is active. gpud runs inside a container here, so the container's own
   # systemd does not manage containerd; the chart wraps "systemctl is-active
@@ -141,6 +157,14 @@ gpud:
   # (mountContainerd) plus the same hostPID/privileged settings as above.
   # Set to "" to use gpud's built-in in-namespace systemd check.
   containerdServiceActiveCommands: "nsenter --target 1 --mount -- systemctl is-active containerd"
+
+  # Mount the GPU Operator's host driver installation at /run/nvidia/driver.
+  # The matching GPUD_NVIDIA_DRIVER_ROOT environment variable makes gpud use
+  # NVML from that tree when present. This is Helm/container-specific; systemd
+  # installations retain the standard system-library lookup.
+  # Enable this on GPU Operator clusters. It defaults to false so the chart does
+  # not create /run/nvidia/driver on nodes that use preinstalled drivers.
+  mountNVIDIADriverRoot: false
 
   # Mount the host containerd directories so the containerd component can monitor
   # the node's containerd when gpud runs inside a container:
@@ -153,6 +177,24 @@ gpud:
   # without containerd (the component then reports containerd as not installed).
   # Set to false on nodes that do not run containerd (e.g. docker/cri-o only).
   mountContainerd: true
+
+  # Mount the host CRI-O runtime directory (/run/crio, read-write so the CRI
+  # unix socket can be dialed) so the containerd component can detect that
+  # CRI-O is the node's container runtime. On a CRI-O node the containerd
+  # socket is expected to be absent; without this mount the component cannot
+  # reach the CRI-O socket from inside the pod and would report the node
+  # unhealthy for a missing containerd socket that is not actually a failure.
+  #
+  # Leaving this at the default true on a node without CRI-O is safe.
+  # DirectoryOrCreate makes kubelet create an empty /run/crio on the host, so
+  # the pod starts normally; gpud then finds no crio.sock, the CRI-O probe
+  # reports "not running", and the containerd check behaves exactly as if this
+  # mount did not exist. The only side effect is the empty /run/crio directory
+  # left on the host. On nodes where the containerd socket does exist, the
+  # CRI-O probe is never called at all.
+  #
+  # Set to false only if the node group uses a non-standard CRI-O socket path.
+  mountCrio: true
 
   # Mount /dev/mem for deep hardware inspection and memory diagnostics (e.g., PCIe config space).
   # Defaults to false for maximum compatibility across platforms (addresses issue #1144).
@@ -181,7 +223,8 @@ gpud:
   # Override the default command for the gpud container.
   # If set, the chart's default startup wrapper is bypassed; include any gpud
   # flags you still need there, including --reboot-commands and the disk
-  # --findmnt-commands/--lsblk-commands/--blockdev-usage-commands when applicable.
+  # --findmnt-commands/--lsblk-commands/--blockdev-usage-commands, plus
+  # --nfs-host-root when NFS checks must access the node filesystem.
   commandOverride: []
 
 # The default image repository is public and needs no image pull secret.

@@ -22,6 +22,8 @@ import (
 	nvidianvml "github.com/leptonai/gpud/pkg/nvidia/nvml"
 	nvidiadevice "github.com/leptonai/gpud/pkg/nvidia/nvml/device"
 	nvidiatestutil "github.com/leptonai/gpud/pkg/nvidia/nvml/testutil"
+	"github.com/leptonai/gpud/pkg/providers"
+	pkgprovidersall "github.com/leptonai/gpud/pkg/providers/all"
 )
 
 type machineInfoCoverageDevice struct {
@@ -376,6 +378,18 @@ func TestMachineInfoDiskCommands_WithMockey(t *testing.T) {
 		assert.Equal(t, "/dev/sda1", info.BlockDevices[0].Name)
 		assert.Equal(t, "server:/data", info.BlockDevices[1].Name)
 
+		// GetMachineDiskInfo above already exercises the configured commands. Avoid
+		// launching the same shell-backed df fixture again here: under the full CI
+		// suite that second short-lived process can sporadically produce no parsed
+		// rows. GetSystemResourceRootVolumeTotal only needs a root usage result for
+		// this assertion; command execution and df parsing have dedicated tests.
+		mockey.Mock(disk.GetPartitions).To(func(ctx context.Context, opts ...disk.OpOption) (disk.Partitions, error) {
+			return disk.Partitions{{
+				MountPoint: "/",
+				Usage:      &disk.Usage{TotalBytes: 1000},
+			}}, nil
+		}).Build()
+
 		total, err := GetSystemResourceRootVolumeTotal()
 		require.NoError(t, err)
 		assert.Equal(t, "1k", total)
@@ -445,6 +459,10 @@ func TestGetMachineInfo_LinuxBranches_WithMockey(t *testing.T) {
 		mockey.Mock(componentcontainerd.GetVersion).To(func(ctx context.Context, endpoint string) (string, error) {
 			return "", errors.New("containerd version failed")
 		}).Build()
+		// Pin CRI-O detection so this test stays host-independent: with
+		// ContainerRuntimeVersion empty, GetMachineInfo would otherwise probe
+		// the host's real CRI-O endpoint and could set the version on a CRI-O box.
+		mockey.Mock(componentcontainerd.CheckCRIORunning).To(func(ctx context.Context) bool { return false }).Build()
 		mockey.Mock(componenttailscale.CheckTailscaleInstalled).To(func() bool { return true }).Build()
 		mockey.Mock(componenttailscale.GetTailscaleVersion).To(func() (string, error) {
 			return "", errors.New("tailscale version failed")
@@ -455,5 +473,147 @@ func TestGetMachineInfo_LinuxBranches_WithMockey(t *testing.T) {
 		require.NotNil(t, info)
 		assert.Equal(t, "", info.ContainerRuntimeVersion)
 		assert.Equal(t, "", info.TailscaleVersion)
+	})
+
+	mockey.PatchConvey("GetMachineInfo falls back to CRI-O version when containerd is absent", t, func() {
+		mockey.Mock(currentGOOS).To(func() string { return "linux" }).Build()
+		mockey.Mock(GetMachineGPUInfo).To(func(nvidianvml.Instance) (*apiv1.MachineGPUInfo, error) {
+			return &apiv1.MachineGPUInfo{}, nil
+		}).Build()
+		mockey.Mock(GetMachineDiskInfo).To(func(ctx context.Context) (*apiv1.MachineDiskInfo, error) {
+			return &apiv1.MachineDiskInfo{}, nil
+		}).Build()
+		// containerd binary present but not running (CRI-O node): containerd
+		// version stays empty, so the CRI-O fallback must supply the runtime.
+		mockey.Mock(componentcontainerd.CheckContainerdInstalled).To(func() bool { return true }).Build()
+		mockey.Mock(componentcontainerd.CheckContainerdRunning).To(func(ctx context.Context) bool { return false }).Build()
+		mockey.Mock(componentcontainerd.CheckCRIORunning).To(func(ctx context.Context) bool { return true }).Build()
+		mockey.Mock(componentcontainerd.GetVersion).To(func(ctx context.Context, endpoint string) (string, error) {
+			if endpoint == componentcontainerd.DefaultCRIOEndpoint {
+				return "1.30.3", nil
+			}
+			return "", errors.New("containerd endpoint unreachable")
+		}).Build()
+		mockey.Mock(componenttailscale.CheckTailscaleInstalled).To(func() bool { return false }).Build()
+
+		info, err := GetMachineInfo(baseNVML)
+		require.NoError(t, err)
+		require.NotNil(t, info)
+		assert.Equal(t, "cri-o://1.30.3", info.ContainerRuntimeVersion)
+	})
+
+	mockey.PatchConvey("GetMachineInfo keeps runtime empty when the CRI-O version lookup fails", t, func() {
+		mockey.Mock(currentGOOS).To(func() string { return "linux" }).Build()
+		mockey.Mock(GetMachineGPUInfo).To(func(nvidianvml.Instance) (*apiv1.MachineGPUInfo, error) {
+			return &apiv1.MachineGPUInfo{}, nil
+		}).Build()
+		mockey.Mock(GetMachineDiskInfo).To(func(ctx context.Context) (*apiv1.MachineDiskInfo, error) {
+			return &apiv1.MachineDiskInfo{}, nil
+		}).Build()
+		// CRI-O is live but its Version RPC fails: the runtime must stay empty
+		// rather than report a version we never actually read.
+		mockey.Mock(componentcontainerd.CheckContainerdInstalled).To(func() bool { return false }).Build()
+		mockey.Mock(componentcontainerd.CheckContainerdRunning).To(func(ctx context.Context) bool { return false }).Build()
+		mockey.Mock(componentcontainerd.CheckCRIORunning).To(func(ctx context.Context) bool { return true }).Build()
+		mockey.Mock(componentcontainerd.GetVersion).To(func(ctx context.Context, endpoint string) (string, error) {
+			return "", errors.New("cri-o version failed")
+		}).Build()
+		mockey.Mock(componenttailscale.CheckTailscaleInstalled).To(func() bool { return false }).Build()
+
+		info, err := GetMachineInfo(baseNVML)
+		require.NoError(t, err)
+		require.NotNil(t, info)
+		assert.Equal(t, "", info.ContainerRuntimeVersion)
+	})
+
+	mockey.PatchConvey("GetMachineInfo does not double-prefix an already-prefixed CRI-O version", t, func() {
+		mockey.Mock(currentGOOS).To(func() string { return "linux" }).Build()
+		mockey.Mock(GetMachineGPUInfo).To(func(nvidianvml.Instance) (*apiv1.MachineGPUInfo, error) {
+			return &apiv1.MachineGPUInfo{}, nil
+		}).Build()
+		mockey.Mock(GetMachineDiskInfo).To(func(ctx context.Context) (*apiv1.MachineDiskInfo, error) {
+			return &apiv1.MachineDiskInfo{}, nil
+		}).Build()
+		mockey.Mock(componentcontainerd.CheckContainerdInstalled).To(func() bool { return false }).Build()
+		mockey.Mock(componentcontainerd.CheckContainerdRunning).To(func(ctx context.Context) bool { return false }).Build()
+		mockey.Mock(componentcontainerd.CheckCRIORunning).To(func(ctx context.Context) bool { return true }).Build()
+		mockey.Mock(componentcontainerd.GetVersion).To(func(ctx context.Context, endpoint string) (string, error) {
+			return "cri-o://1.31.0", nil
+		}).Build()
+		mockey.Mock(componenttailscale.CheckTailscaleInstalled).To(func() bool { return false }).Build()
+
+		info, err := GetMachineInfo(baseNVML)
+		require.NoError(t, err)
+		require.NotNil(t, info)
+		assert.Equal(t, "cri-o://1.31.0", info.ContainerRuntimeVersion)
+	})
+}
+
+func TestGetMachineGPUInfo_MinorAndBoardErrors_WithMockey(t *testing.T) {
+	mockey.PatchConvey("GetMachineGPUInfo returns minor id error", t, func() {
+		dev := newMachineInfoCoverageDevice()
+		dev.minorRet = nvml.ERROR_UNKNOWN
+		mockey.Mock(nvidiamemory.GetMemory).To(
+			func(uuid string, dev nvidiadevice.Device, productName string, getVirtualMemoryFunc nvidiamemory.GetVirtualMemoryFunc) (nvidiamemory.Memory, error) {
+				return nvidiamemory.Memory{TotalBytes: 1}, nil
+			},
+		).Build()
+
+		nvmlInstance := &mockNvmlInstanceForMockey{
+			productName: "NVIDIA H100 80GB HBM3",
+			devices: map[string]nvidiadevice.Device{
+				dev.uuid: dev,
+			},
+		}
+
+		_, err := GetMachineGPUInfo(nvmlInstance)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to get minor id")
+	})
+
+	mockey.PatchConvey("GetMachineGPUInfo returns board id error", t, func() {
+		dev := newMachineInfoCoverageDevice()
+		dev.boardRet = nvml.ERROR_UNKNOWN
+		mockey.Mock(nvidiamemory.GetMemory).To(
+			func(uuid string, dev nvidiadevice.Device, productName string, getVirtualMemoryFunc nvidiamemory.GetVirtualMemoryFunc) (nvidiamemory.Memory, error) {
+				return nvidiamemory.Memory{TotalBytes: 1}, nil
+			},
+		).Build()
+
+		nvmlInstance := &mockNvmlInstanceForMockey{
+			productName: "NVIDIA H100 80GB HBM3",
+			devices: map[string]nvidiadevice.Device{
+				dev.uuid: dev,
+			},
+		}
+
+		_, err := GetMachineGPUInfo(nvmlInstance)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to get board id")
+	})
+}
+
+func TestGetMachineInfo_GPUInfoError_WithMockey(t *testing.T) {
+	mockey.PatchConvey("GetMachineInfo returns gpu info error", t, func() {
+		mockey.Mock(GetMachineGPUInfo).To(func(nvidianvml.Instance) (*apiv1.MachineGPUInfo, error) {
+			return nil, errors.New("gpu info failed")
+		}).Build()
+
+		_, err := GetMachineInfo(&mockNvmlInstanceForMockey{})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to get machine gpu info")
+	})
+}
+
+func TestGetProviderWithContext_BlankProviderName_WithMockey(t *testing.T) {
+	mockey.PatchConvey("whitespace-only provider name falls back to unknown", t, func() {
+		mockey.Mock(pkgprovidersall.Detect).To(func(ctx context.Context) (*providers.Info, error) {
+			return &providers.Info{Provider: "   "}, nil
+		}).Build()
+
+		info := GetProviderWithContext(context.Background(), "1.2.3.4")
+		require.NotNil(t, info)
+		assert.Equal(t, "unknown", info.Provider)
+		assert.Equal(t, "1.2.3.4", info.PublicIP)
 	})
 }

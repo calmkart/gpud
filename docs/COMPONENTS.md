@@ -26,11 +26,10 @@
 - [**`docker`**](https://pkg.go.dev/github.com/leptonai/gpud/components/docker): Tracks the current containers from the docker runtime.
 - [**`fuse`**](https://pkg.go.dev/github.com/leptonai/gpud/components/fuse): Tracks the FUSE connections.
 - [**`kernel-module`**](https://pkg.go.dev/github.com/leptonai/gpud/components/kernel-module): Monitors the FUSE (Filesystem in Userspace).
-- [**`kubelet`**](https://pkg.go.dev/github.com/leptonai/gpud/components/kubelet): Tracks the kubelet status.
 - [**`library`**](https://pkg.go.dev/github.com/leptonai/gpud/components/library): Checks system libraries such as "libnvidia-ml.so" and "libcuda.so", if applicable.
 - [**`memory`**](https://pkg.go.dev/github.com/leptonai/gpud/components/memory): Tracks the memory usage of the host.
 - [**`network-latency`**](https://pkg.go.dev/github.com/leptonai/gpud/components/network/latency): Tracks global network connectivity statistics.
 - [**`nfs`**](https://pkg.go.dev/github.com/leptonai/gpud/components/nfs): Tracks the NFS volume healthiness.
-- [**`os`**](https://pkg.go.dev/github.com/leptonai/gpud/components/os): Queries the host OS information (e.g., kernel version, file descriptor usage).
+- [**`os`**](https://pkg.go.dev/github.com/leptonai/gpud/components/os): Queries the host OS information (e.g., kernel version, file descriptor usage) and tracks persistent D-state (uninterruptible sleep) processes.
 - [**`pci`**](https://pkg.go.dev/github.com/leptonai/gpud/components/pci): Tracks the PCI devices and their Access Control Services (ACS) status.
 - [**`tailscale`**](https://pkg.go.dev/github.com/leptonai/gpud/components/tailscale): Tracks the tailscale state (e.g., version) if available.

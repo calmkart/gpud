@@ -18,9 +18,7 @@ import (
 
 	apiv1 "github.com/leptonai/gpud/api/v1"
 	"github.com/leptonai/gpud/components"
-	componentkubelet "github.com/leptonai/gpud/components/kubelet"
 	"github.com/leptonai/gpud/pkg/log"
-	"github.com/leptonai/gpud/pkg/netutil"
 	nvidianvml "github.com/leptonai/gpud/pkg/nvidia/nvml"
 	"github.com/leptonai/gpud/pkg/systemd"
 )
@@ -28,8 +26,6 @@ import (
 // Name is the ID of the containerd component.
 const (
 	Name                        = "containerd"
-	DanglingDegradedThreshold   = 5
-	DanglingUnhealthyThreshold  = 10
 	defaultContainerdConfigPath = "/etc/containerd/config.toml"
 
 	defaultActivenssCheckUptimeThreshold = 5 * time.Minute
@@ -68,6 +64,7 @@ type component struct {
 
 	checkDependencyInstalledFunc  func() bool
 	checkSocketExistsFunc         func() bool
+	checkCRIORunningFunc          func(context.Context) bool
 	checkContainerdRunningFunc    func(context.Context) bool
 	checkServiceActiveFunc        func(context.Context) (bool, error)
 	getContainerdUptimeFunc       func() (*time.Duration, error)
@@ -113,6 +110,7 @@ func New(gpudInstance *components.GPUdInstance) (components.Component, error) {
 
 		checkDependencyInstalledFunc: checkContainerdInstalled,
 		checkSocketExistsFunc:        checkSocketExistsFunc,
+		checkCRIORunningFunc:         CheckCRIORunning,
 		checkContainerdRunningFunc:   CheckContainerdRunning,
 		// checkServiceActiveFunc defaults to the in-namespace systemd.IsActive
 		// check. When ContainerdServiceActiveCommands is set (e.g. wrapping
@@ -269,6 +267,29 @@ func (c *component) Check() components.CheckResult {
 		return cr
 	}
 
+	// An installed containerd binary does not make containerd the node's
+	// container runtime: BYOK clusters that use CRI-O still ship the
+	// containerd binary (the gpud image installs containerd.io), but
+	// containerd is never started and its socket never appears. Without this
+	// skip, the activeness check below marks such nodes Unhealthy after five
+	// consecutive misses even though nothing is wrong (LEP-6128).
+	//
+	// CRI-O is probed with a real CRI connection (CheckCRIORunning) rather
+	// than a bare socket stat so a stale socket left by a crashed CRI-O does
+	// not spoof a containerd node into skipping a genuine containerd outage.
+	if c.checkSocketExistsFunc != nil && !c.checkSocketExistsFunc() &&
+		c.checkCRIORunningFunc != nil {
+		cctx, ccancel := context.WithTimeout(c.ctx, 15*time.Second)
+		crioRunning := c.checkCRIORunningFunc(cctx)
+		ccancel()
+		if crioRunning {
+			c.recordSocketMissing(false)
+			cr.health = apiv1.HealthStateTypeHealthy
+			cr.reason = "containerd installed but CRI-O is the active container runtime, skipping containerd checks"
+			return cr
+		}
+	}
+
 	// below are the checks in case "containerd" is installed, thus requires activeness checks
 	if ok := c.checkContainerdActiveness(cr); !ok {
 		log.Logger.Warnw(
@@ -323,34 +344,6 @@ func (c *component) Check() components.CheckResult {
 			return cr
 		}
 
-		var danglingCount int
-		// skip dangling-pod check if kubelet read-only port is closed
-		if netutil.IsPortOpen(componentkubelet.DefaultKubeletReadOnlyPort) {
-			cctx, ccancel = context.WithTimeout(c.ctx, 30*time.Second)
-			_, kubeletPods, err := componentkubelet.ListPodsFromKubeletReadOnlyPort(cctx, componentkubelet.DefaultKubeletReadOnlyPort)
-			ccancel()
-			if err != nil {
-				log.Logger.Errorf("error listing pods from kubelet: %v", err)
-			} else {
-				danglingCount = danglingPodCount(cr.Pods, kubeletPods)
-			}
-		}
-		switch {
-		case danglingCount > DanglingUnhealthyThreshold:
-			cr.health = apiv1.HealthStateTypeUnhealthy
-			cr.reason = fmt.Sprintf("node has %v dangling pods, unhealthy threshold %v", danglingCount, DanglingUnhealthyThreshold)
-			cr.suggestedAction = &apiv1.SuggestedActions{
-				Description:   "too many dangling pod",
-				RepairActions: []apiv1.RepairActionType{apiv1.RepairActionTypeRebootSystem},
-			}
-			return cr
-		case danglingCount > DanglingDegradedThreshold:
-			cr.health = apiv1.HealthStateTypeDegraded
-			cr.reason = fmt.Sprintf("node has %v dangling pods, consider reboot system to recover, degraded threshold %v", danglingCount, DanglingDegradedThreshold)
-			return cr
-		case danglingCount != 0:
-			cr.reason = fmt.Sprintf("node has %v dangling pods", danglingCount)
-		}
 	}
 	log.Logger.Debugw(cr.reason, "count", len(cr.Pods))
 
@@ -568,27 +561,4 @@ func appendImportedContainerdConfigs(config []byte) []byte {
 		}
 	}
 	return out
-}
-
-func danglingPodCount(containerdPods []PodSandbox, kubeletPods []componentkubelet.PodStatus) int {
-	var danglingCount int
-	if len(kubeletPods) == 0 {
-		return danglingCount
-	}
-	podMap := make(map[string]struct{})
-	for _, pod := range kubeletPods {
-		podKey := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
-		podMap[podKey] = struct{}{}
-	}
-	for _, pod := range containerdPods {
-		if pod.State != "SANDBOX_READY" {
-			continue
-		}
-		podKey := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
-		if _, ok := podMap[podKey]; !ok {
-			danglingCount++
-		}
-	}
-
-	return danglingCount
 }

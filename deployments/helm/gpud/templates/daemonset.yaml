@@ -159,6 +159,16 @@ spec:
             path: /var/lib/kubelet
             type: DirectoryOrCreate
 
+        {{- if .Values.gpud.mountNVIDIADriverRoot }}
+        # GPU Operator installs its driver libraries under this host path.
+        # On preinstalled-driver nodes this may be empty; gpud then preserves its
+        # normal system-library lookup.
+        - name: host-nvidia-driver
+          hostPath:
+            path: /run/nvidia/driver
+            type: DirectoryOrCreate
+        {{- end }}
+
         {{- if .Values.gpud.mountContainerd }}
         # Host containerd runtime directory (holds containerd.sock).
         # Required by: components/containerd (stat the socket and reach the CRI
@@ -176,6 +186,22 @@ spec:
         - name: host-etc-containerd
           hostPath:
             path: /etc/containerd
+            type: DirectoryOrCreate
+        {{- end }}
+
+        {{- if .Values.gpud.mountCrio }}
+        # Host CRI-O runtime directory (holds crio.sock).
+        # Required by: components/containerd (dial the CRI endpoint at
+        # unix:///run/crio/crio.sock to detect that CRI-O is the node's
+        # container runtime, and skip the containerd check instead of
+        # reporting a missing containerd socket as unhealthy).
+        # DirectoryOrCreate so the pod still starts on nodes without CRI-O:
+        # kubelet creates an empty /run/crio on such hosts, gpud finds no
+        # crio.sock there, and the containerd check runs exactly as it would
+        # without this mount.
+        - name: host-run-crio
+          hostPath:
+            path: /run/crio
             type: DirectoryOrCreate
         {{- end }}
       {{- if .Values.extraVolumes }}
@@ -408,6 +434,17 @@ spec:
                 start_log_args="$start_log_args --blockdev-usage-commands=<set>"
                 set -- "$@" --blockdev-usage-commands="$GPUD_BLOCKDEV_USAGE_COMMANDS"
               fi
+
+              # BYOK: this is a node filesystem prefix, not a required NFS mount.
+              # It lets gpud resolve only the NFS paths configured for this
+              # machine through /proc/1/root. Nodes without an NFS config do not
+              # probe a path, and a missing configured mount degrades the check
+              # without preventing this DaemonSet pod from starting. Systemd
+              # installations do not use this Helm-only default.
+              if [ -n "${GPUD_NFS_HOST_ROOT:-}" ]; then
+                start_log_args="$start_log_args --nfs-host-root=$GPUD_NFS_HOST_ROOT"
+                set -- "$@" --nfs-host-root="$GPUD_NFS_HOST_ROOT"
+              fi
               if [ -n "${GPUD_CONTAINERD_SERVICE_ACTIVE_COMMANDS:-}" ]; then
                 start_log_args="$start_log_args --containerd-service-active-commands=<set>"
                 set -- "$@" --containerd-service-active-commands="$GPUD_CONTAINERD_SERVICE_ACTIVE_COMMANDS"
@@ -421,6 +458,12 @@ spec:
           env:
             - name: GPUD_NO_USAGE_STATS
               value: {{ not .Values.gpud.telemetry.enabled | quote }}
+            {{- if .Values.gpud.mountNVIDIADriverRoot }}
+            # Opt in to the GPU Operator driver-root fallback. Bare-metal/systemd
+            # runs do not receive this environment variable.
+            - name: GPUD_NVIDIA_DRIVER_ROOT
+              value: /run/nvidia/driver
+            {{- end }}
             {{- if .Values.gpud.tokenSecret.name }}
             # Session token sourced from an existing Secret (takes priority over a
             # token node label). Consumed by the startup script as $GPUD_TOKEN.
@@ -457,6 +500,12 @@ spec:
             {{- if .Values.gpud.blockdevUsageCommands }}
             - name: GPUD_BLOCKDEV_USAGE_COMMANDS
               value: {{ .Values.gpud.blockdevUsageCommands | quote }}
+            {{- end }}
+            {{- if .Values.gpud.nfsHostRoot }}
+            # BYOK: this value is only a host filesystem prefix. It does not
+            # assert that any particular NFS path exists on every DaemonSet node.
+            - name: GPUD_NFS_HOST_ROOT
+              value: {{ .Values.gpud.nfsHostRoot | quote }}
             {{- end }}
             {{- if .Values.gpud.containerdServiceActiveCommands }}
             - name: GPUD_CONTAINERD_SERVICE_ACTIVE_COMMANDS
@@ -550,6 +599,14 @@ spec:
               mountPath: /var/lib/kubelet
               readOnly: true
 
+            {{- if .Values.gpud.mountNVIDIADriverRoot }}
+            # GPU Operator-managed driver libraries. Read-only because gpud only
+            # loads NVML and never modifies the driver installation.
+            - name: host-nvidia-driver
+              mountPath: /run/nvidia/driver
+              readOnly: true
+            {{- end }}
+
             {{- if .Values.gpud.mountContainerd }}
             # Host containerd socket directory for containerd monitoring.
             # Mounted at the same path gpud expects (/run/containerd/containerd.sock).
@@ -562,6 +619,15 @@ spec:
             - name: host-etc-containerd
               mountPath: /etc/containerd
               readOnly: true
+            {{- end }}
+
+            {{- if .Values.gpud.mountCrio }}
+            # Host CRI-O socket directory for the containerd component's CRI-O
+            # detection. Mounted at the same path gpud expects
+            # (/run/crio/crio.sock). Not read-only: connecting to the CRI unix
+            # socket requires write access (same reason /run/containerd is rw).
+            - name: host-run-crio
+              mountPath: /run/crio
             {{- end }}
           {{- if .Values.extraVolumeMounts }}
           {{- toYaml .Values.extraVolumeMounts | nindent 12 }}

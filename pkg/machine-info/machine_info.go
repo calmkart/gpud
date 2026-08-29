@@ -37,7 +37,10 @@ import (
 	"github.com/leptonai/gpud/version"
 )
 
-const diskPartitionsTimeout = 10 * time.Second
+const (
+	diskPartitionsTimeout             = 10 * time.Second
+	minDriverMajorForNVMLPlatformInfo = 570
+)
 
 type diskCommands struct {
 	findmntCommand       string
@@ -95,6 +98,14 @@ func GetMachineInfo(nvmlInstance nvidianvml.Instance) (*apiv1.MachineInfo, error
 		return nil, fmt.Errorf("failed to get machine gpu info: %w", err)
 	}
 
+	// The control plane records these values next to the other GPU properties in
+	// Machine.Status.MachineInfo.GPUInfo. Keep the producer wire shape aligned
+	// with that CRD shape so gpud-manager can unmarshal and persist them.
+	if info.GPUInfo != nil {
+		info.GPUInfo.ClusterUUID, info.GPUInfo.CliqueID = getGPUFabricIdentifiers(nvmlInstance)
+		info.GPUInfo.ChassisSerial = getGPUChassisSerial(nvmlInstance)
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 
@@ -113,6 +124,22 @@ func GetMachineInfo(nvmlInstance nvidianvml.Instance) (*apiv1.MachineInfo, error
 					containerdVersion = "containerd://" + containerdVersion
 				}
 				info.ContainerRuntimeVersion = containerdVersion
+			}
+		}
+
+		// On a CRI-O node the containerd binary is installed but not running,
+		// so the block above leaves the runtime version empty even though the
+		// node has a live runtime. Fall back to CRI-O so the reported runtime
+		// reflects what actually runs the node's containers (LEP-6128).
+		if info.ContainerRuntimeVersion == "" && componentcontainerd.CheckCRIORunning(ctx) {
+			crioVersion, err := componentcontainerd.GetVersion(ctx, componentcontainerd.DefaultCRIOEndpoint)
+			if err != nil {
+				log.Logger.Warnw("failed to check cri-o version", "error", err)
+			} else {
+				if !strings.HasPrefix(crioVersion, "cri-o://") {
+					crioVersion = "cri-o://" + crioVersion
+				}
+				info.ContainerRuntimeVersion = crioVersion
 			}
 		}
 
@@ -273,9 +300,19 @@ func GetProvider(publicIP string) *providers.Info {
 
 // GetProviderWithContext passes the caller's context to metadata provider detection.
 func GetProviderWithContext(ctx context.Context, publicIP string) *providers.Info {
+	return getProviderWithContext(ctx, publicIP, pkgprovidersall.Detect)
+}
+
+func getProviderForLogin(publicIP, region string) *providers.Info {
+	return getProviderWithContext(context.Background(), publicIP, func(ctx context.Context) (*providers.Info, error) {
+		return pkgprovidersall.DetectWithRegionOverride(ctx, region)
+	})
+}
+
+func getProviderWithContext(ctx context.Context, publicIP string, detect func(context.Context) (*providers.Info, error)) *providers.Info {
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	providerInfo, err := pkgprovidersall.Detect(ctx)
+	providerInfo, err := detect(ctx)
 	if err != nil {
 		log.Logger.Warnw("failed to detect provider", "error", err)
 	} else {
@@ -337,7 +374,7 @@ func GetProviderWithContext(ctx context.Context, publicIP string) *providers.Inf
 	}
 
 	if providerInfo.Provider == "nebius" && providerInfo.InstanceID == "" {
-		instanceID, err := nebius.GetInstanceID()
+		instanceID, err := nebius.GetInstanceID(ctx)
 		if err != nil {
 			log.Logger.Warnw("failed to get Nebius instance ID", "error", err)
 		} else {
@@ -411,6 +448,44 @@ func GetSystemResourceGPUCount(nvmlInstance nvidianvml.Instance) (string, error)
 
 	qty := resource.NewQuantity(int64(deviceCount), resource.DecimalSI)
 	return qty.String(), nil
+}
+
+// getGPUFabricIdentifiers returns the NVLink fabric cluster UUID and clique ID
+// of the machine (e.g., NVIDIA GB200 NVL72). All GPUs on the same machine share
+// these identifiers, so the first device with a readable fabric state is
+// sufficient. Fabric state telemetry is not supported on all platforms; in
+// that case this function returns empty values and does not fail.
+func getGPUFabricIdentifiers(nvmlInstance nvidianvml.Instance) (string, *uint32) {
+	for uuid, dev := range nvmlInstance.Devices() {
+		fabricState, err := dev.GetFabricState()
+		if err != nil {
+			log.Logger.Debugw("failed to get GPU fabric state for machine info", "uuid", uuid, "error", err)
+			continue
+		}
+		cliqueID := fabricState.CliqueID
+		return fabricState.ClusterUUID, &cliqueID
+	}
+	return "", nil
+}
+
+// getGPUChassisSerial returns the chassis serial reported by NVML platform
+// info. The API first shipped with R570; calling it on older drivers can fail
+// during symbol resolution before NVML can return ERROR_NOT_SUPPORTED.
+func getGPUChassisSerial(nvmlInstance nvidianvml.Instance) string {
+	if nvmlInstance.DriverMajor() < minDriverMajorForNVMLPlatformInfo {
+		return ""
+	}
+	for uuid, dev := range nvmlInstance.Devices() {
+		platformInfo, ret := dev.GetPlatformInfo()
+		if ret != nvml.SUCCESS {
+			log.Logger.Debugw("failed to get GPU platform info for machine info", "uuid", uuid, "error", nvml.ErrorString(ret))
+			continue
+		}
+		if serial := strings.TrimRight(string(platformInfo.ChassisSerialNumber[:]), "\x00"); serial != "" {
+			return serial
+		}
+	}
+	return ""
 }
 
 func GetMachineGPUInfo(nvmlInstance nvidianvml.Instance) (*apiv1.MachineGPUInfo, error) {

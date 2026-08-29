@@ -67,6 +67,9 @@ type LoginConfig struct {
 
 	PublicIP  string // optional: overrides detected public IP
 	PrivateIP string // optional: overrides detected private IP
+
+	// Region overrides the login region and skips provider-region IMDS and DERP lookup.
+	Region string
 }
 
 // Login performs the login operation with the control plane.
@@ -291,7 +294,7 @@ func Login(ctx context.Context, cfg LoginConfig) error {
 	// otherwise, the control plane will assign a new machine ID
 	loginCreatedAt := time.Now()
 	log.Logger.Debugw("creating login request")
-	req, err := pkgmachineinfo.CreateLoginRequest(cfg.Token, cfg.MachineID, cfg.NodeGroup, cfg.GPUCount, nvmlInstance)
+	req, err := pkgmachineinfo.CreateLoginRequestWithRegion(cfg.Token, cfg.MachineID, cfg.NodeGroup, cfg.GPUCount, cfg.Region, nvmlInstance)
 	if err != nil {
 		return fmt.Errorf("failed to create login request: %w", err)
 	}

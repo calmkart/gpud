@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const (
@@ -25,6 +27,9 @@ type OpenStackMetadataResponse struct {
 type OpenStackMetadataMeta struct {
 	OrganizationID string `json:"organizationID"`
 	ProjectID      string `json:"projectID"`
+	// RegionID may be a human-readable region or an opaque provider UUID.
+	// ref. https://docs.openstack.org/nova/latest/user/metadata.html
+	RegionID string `json:"regionID"`
 }
 
 // FetchMetadata fetches metadata from the nscale metadata service at the specified path.
@@ -112,4 +117,31 @@ func fetchOpenStackMetadata(ctx context.Context, metadataURL string) (*OpenStack
 		return nil, fmt.Errorf("failed to parse OpenStack metadata: %w", err)
 	}
 	return resp, nil
+}
+
+// FetchRegion returns a human-readable nscale region from OpenStack metadata.
+// ref. https://docs.openstack.org/nova/latest/user/metadata.html
+func FetchRegion(ctx context.Context) (string, error) {
+	return fetchRegion(ctx, openStackMetadataJSONURL)
+}
+
+// fetchRegion retrieves the nscale region from the OpenStack metadata JSON
+// at the specified URL. It is separated from FetchRegion so that unit tests
+// can supply an httptest server URL.
+func fetchRegion(ctx context.Context, metadataURL string) (string, error) {
+	resp, err := fetchOpenStackMetadata(ctx, metadataURL)
+	if err != nil {
+		return "", err
+	}
+	for _, candidate := range []string{resp.Meta.RegionID, resp.AvailabilityZone} {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" || strings.EqualFold(candidate, "unknown") || strings.EqualFold(candidate, "nova") {
+			continue
+		}
+		if _, err := uuid.Parse(candidate); err == nil {
+			continue
+		}
+		return candidate, nil
+	}
+	return "", fmt.Errorf("nscale metadata has no usable region; set one with gpud up --region")
 }

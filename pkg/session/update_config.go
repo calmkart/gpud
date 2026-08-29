@@ -1,9 +1,7 @@
 package session
 
 import (
-	"context"
 	"encoding/json"
-	"time"
 
 	componentsnvidiagpucounts "github.com/leptonai/gpud/components/accelerator/nvidia/gpu-counts"
 	componentsnvidiainfiniband "github.com/leptonai/gpud/components/accelerator/nvidia/infiniband"
@@ -12,6 +10,7 @@ import (
 	componentstemperature "github.com/leptonai/gpud/components/accelerator/nvidia/temperature"
 	componentsxid "github.com/leptonai/gpud/components/accelerator/nvidia/xid"
 	componentsnfs "github.com/leptonai/gpud/components/nfs"
+	componentsos "github.com/leptonai/gpud/components/os"
 	"github.com/leptonai/gpud/pkg/log"
 	pkgnfschecker "github.com/leptonai/gpud/pkg/nfs-checker"
 )
@@ -95,20 +94,28 @@ func (s *Session) processUpdateConfig(configMap map[string]string, resp *Respons
 				return
 			}
 
-			// if NFS validation takes too long, it can block other session requests
-			// so we set a timeout and do it async
-			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				err := updateCfgs.Validate(ctx)
-				cancel()
-				if err != nil {
-					log.Logger.Warnw("invalid nfs config but proceeding with update to allow the user to fix the config", "error", err)
-				}
+			// Path validation belongs to the NFS component, which has the deployment's
+			// host-root view. Validating here would inspect the container namespace and
+			// incorrectly reject valid BYOK node paths before /proc/1/root is applied.
+			if s.setDefaultNFSGroupConfigsFunc != nil {
+				s.setDefaultNFSGroupConfigsFunc(updateCfgs)
+			}
 
-				if s.setDefaultNFSGroupConfigsFunc != nil {
-					s.setDefaultNFSGroupConfigsFunc(updateCfgs)
+		case componentsos.Name:
+			setComponents[componentName] = struct{}{}
+			var updateCfg componentsos.BlockedProcessThresholds
+			if err := json.Unmarshal([]byte(value), &updateCfg); err != nil {
+				log.Logger.Warnw("failed to unmarshal os blocked process thresholds config", "error", err)
+				resp.Error = err.Error()
+				return
+			}
+			if s.setDefaultOSBlockedProcessThresholdsFunc != nil {
+				if err := s.setDefaultOSBlockedProcessThresholdsFunc(updateCfg); err != nil {
+					log.Logger.Warnw("failed to set os blocked process thresholds", "error", err)
+					resp.Error = err.Error()
+					return
 				}
-			}()
+			}
 
 		default:
 			log.Logger.Warnw("unsupported component for updateConfig", "component", componentName)
@@ -139,5 +146,16 @@ func (s *Session) processUpdateConfig(configMap map[string]string, resp *Respons
 	if _, ok := setComponents[componentstemperature.Name]; !ok && s.setDefaultTemperatureThresholdsFunc != nil {
 		log.Logger.Infow("falling back to default temperature config")
 		s.setDefaultTemperatureThresholdsFunc(componentstemperature.Thresholds{CelsiusSlowdownMargin: componentstemperature.ThresholdCelsiusSlowdownMargin})
+	}
+	// os falls back to the startup-resolved thresholds (CLI flags + NVIDIA GPU
+	// auto-detection), not the built-in empty default: resetting to empty here
+	// would silently disable D-state tracking on GPU machines whenever the
+	// control plane pushes a config that does not mention the os component.
+	if _, ok := setComponents[componentsos.Name]; !ok && s.setDefaultOSBlockedProcessThresholdsFunc != nil {
+		log.Logger.Infow("falling back to startup os blocked process thresholds")
+		if err := s.setDefaultOSBlockedProcessThresholdsFunc(componentsos.GetStartupBlockedProcessThresholds()); err != nil {
+			// the startup baseline was validated when recorded; log defensively
+			log.Logger.Warnw("failed to restore startup os blocked process thresholds", "error", err)
+		}
 	}
 }

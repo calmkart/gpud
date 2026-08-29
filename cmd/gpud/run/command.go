@@ -58,6 +58,7 @@ func Command(cliContext *cli.Context) error {
 	findmntCommands := cliContext.String("findmnt-commands")
 	lsblkCommands := cliContext.String("lsblk-commands")
 	blockdevUsageCommands := cliContext.String("blockdev-usage-commands")
+	nfsHostRoot := cliContext.String("nfs-host-root")
 	pkgmachineinfo.SetDiskCommands(findmntCommands, lsblkCommands, blockdevUsageCommands)
 
 	// Parse db-in-memory early as it affects login behavior
@@ -234,6 +235,13 @@ func Command(cliContext *cli.Context) error {
 		log.Logger.Infow("set sxid thresholds", "sxidOverrides", thresholds.Overrides)
 	}
 
+	// D-state process tracking (LEP-6029): auto-enables with nvidia-matching
+	// regexes when an NVIDIA GPU is detected, unless configured via flags;
+	// the daemon keeps the default persistence threshold (one-off scan uses 1)
+	if err := common.ApplyOSBlockedProcessThresholds(cliContext, common.DetectNvidiaGPU, false); err != nil {
+		return err
+	}
+
 	if eventsRetentionPeriod > 0 && !cliContext.IsSet("xid-lookback-period") {
 		componentsxid.SetLookbackPeriod(eventsRetentionPeriod)
 		log.Logger.Infow("set xid lookback period from events retention period", "xidLookbackPeriod", eventsRetentionPeriod)
@@ -356,6 +364,7 @@ func Command(cliContext *cli.Context) error {
 	cfg.FindmntCommands = findmntCommands
 	cfg.LsblkCommands = lsblkCommands
 	cfg.BlockdevUsageCommands = blockdevUsageCommands
+	cfg.NFSHostRoot = nfsHostRoot
 	cfg.ContainerdServiceActiveCommands = containerdServiceActiveCommands
 	if !versionFileSet {
 		versionFile = config.VersionFilePath(cfg.DataDir)

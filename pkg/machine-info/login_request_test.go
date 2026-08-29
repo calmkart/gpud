@@ -127,6 +127,82 @@ func mockNetworkInterface(publicIP, privateIP string) apiv1.MachineNetworkInterf
 	}
 }
 
+func TestCreateLoginRequest_FailsFastOnMissingRequiredIMDSIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		info    *providers.Info
+		wantErr string
+	}{
+		{
+			name:    "missing instance ID",
+			info:    &providers.Info{Provider: "nscale", Region: "eu-west-2", IMDSDetected: true},
+			wantErr: "did not return an instance ID",
+		},
+		{
+			name:    "missing region",
+			info:    &providers.Info{Provider: "nscale", InstanceID: "instance-1", IMDSDetected: true},
+			wantErr: "did not return a region",
+		},
+		{
+			name:    "unknown region",
+			info:    &providers.Info{Provider: "nscale", Region: RegionUnknown, InstanceID: "instance-1", IMDSDetected: true},
+			wantErr: "did not return a region",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			machineInfoCalled := false
+			req, err := createLoginRequest(
+				"token", "machine-id", "node-group", "0", &mockNvmlInstance{},
+				func() (string, error) { return "", nil },
+				func() *apiv1.MachineLocation { return nil },
+				func(nvidianvml.Instance) (*apiv1.MachineInfo, error) {
+					machineInfoCalled = true
+					return nil, nil
+				},
+				func(string) *providers.Info { return tc.info },
+				func() (string, error) { return "", nil },
+				func(nvidianvml.Instance) (string, error) { return "0", nil },
+			)
+			assert.ErrorContains(t, err, tc.wantErr)
+			assert.Nil(t, req)
+			assert.False(t, machineInfoCalled)
+		})
+	}
+}
+
+func TestCreateLoginRequest_ValidIMDSIdentitySkipsDERP(t *testing.T) {
+	locationCalled := false
+	req, err := createLoginRequest(
+		"token", "machine-id", "node-group", "0", &mockNvmlInstance{},
+		func() (string, error) { return "", nil },
+		func() *apiv1.MachineLocation {
+			locationCalled = true
+			return &apiv1.MachineLocation{Region: "derp-region"}
+		},
+		func(nvidianvml.Instance) (*apiv1.MachineInfo, error) {
+			return &apiv1.MachineInfo{
+				CPUInfo:    &apiv1.MachineCPUInfo{LogicalCores: 4},
+				MemoryInfo: &apiv1.MachineMemoryInfo{TotalBytes: 1024},
+				NICInfo:    &apiv1.MachineNICInfo{},
+			}, nil
+		},
+		func(string) *providers.Info {
+			return &providers.Info{
+				Provider:     "nscale",
+				Region:       "eu-west-2",
+				InstanceID:   "instance-1",
+				IMDSDetected: true,
+			}
+		},
+		func() (string, error) { return "100Gi", nil },
+		func(nvidianvml.Instance) (string, error) { return "0", nil },
+	)
+	assert.NoError(t, err)
+	assert.False(t, locationCalled)
+	assert.Equal(t, "eu-west-2", req.Location.Region)
+	assert.Equal(t, "instance-1", req.ProviderInstanceID)
+}
+
 func TestCreateLoginRequest_Basic(t *testing.T) {
 	tests := []struct {
 		name                                 string
@@ -533,7 +609,7 @@ func TestCreateLoginRequest_UsesDefaultDependenciesWithMockey(t *testing.T) {
 				NICInfo: &apiv1.MachineNICInfo{},
 			}, nil
 		}).Build()
-		mockey.Mock(GetProvider).To(func(ip string) *providers.Info {
+		mockey.Mock(getProviderForLogin).To(func(ip, region string) *providers.Info {
 			return &providers.Info{
 				Provider:   "aws",
 				PublicIP:   ip,
@@ -1197,6 +1273,72 @@ func TestCreateLoginRequest_ProviderRegionOverridesLatencyLocation(t *testing.T)
 	assert.Equal(t, "us-east-1", req.Location.Region)
 	assert.Empty(t, req.Location.Zone)
 	assert.False(t, machineLocationCalled)
+}
+
+// TestCreateLoginRequest_UnknownRegionFallback verifies that the login request
+// reports region "unknown" (never empty) when the provider metadata lookup
+// failed or is unsupported AND the DERP-latency fallback also failed.
+func TestCreateLoginRequest_UnknownRegionFallback(t *testing.T) {
+	getMachineInfoFunc := func(nvidianvml.Instance) (*apiv1.MachineInfo, error) {
+		return &apiv1.MachineInfo{
+			CPUInfo:    &apiv1.MachineCPUInfo{LogicalCores: 4},
+			MemoryInfo: &apiv1.MachineMemoryInfo{TotalBytes: 16 * 1024 * 1024 * 1024},
+			NICInfo:    &apiv1.MachineNICInfo{},
+		}, nil
+	}
+
+	steps := []struct {
+		name              string
+		getProviderFunc   func(string) *providers.Info
+		getMachineLocFunc func() *apiv1.MachineLocation
+	}{
+		{
+			name: "provider without region and DERP returns nil",
+			getProviderFunc: func(ip string) *providers.Info {
+				return &providers.Info{Provider: "nscale", PublicIP: ip, PrivateIP: "7.247.195.146", InstanceID: "i-00001923"}
+			},
+			getMachineLocFunc: func() *apiv1.MachineLocation { return nil },
+		},
+		{
+			// mirrors real GetProvider behavior: returns Info{Provider: "unknown"}
+			// with no region when no provider is detected (never returns nil)
+			name: "provider unsupported and DERP returns nil",
+			getProviderFunc: func(string) *providers.Info {
+				return &providers.Info{Provider: "unknown"}
+			},
+			getMachineLocFunc: func() *apiv1.MachineLocation { return nil },
+		},
+		{
+			name: "provider region empty and DERP returns empty region",
+			getProviderFunc: func(ip string) *providers.Info {
+				return &providers.Info{Provider: "nscale", PublicIP: ip, Region: "  "}
+			},
+			getMachineLocFunc: func() *apiv1.MachineLocation { return &apiv1.MachineLocation{} },
+		},
+	}
+
+	for _, tc := range steps {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := createLoginRequest(
+				"token",
+				"machine-id",
+				"",
+				"1",
+				&mockNvmlInstance{},
+				func() (string, error) { return "46.148.127.98", nil },
+				tc.getMachineLocFunc,
+				getMachineInfoFunc,
+				tc.getProviderFunc,
+				func() (string, error) { return "100Gi", nil },
+				func(nvidianvml.Instance) (string, error) { return "1", nil },
+			)
+
+			assert.NoError(t, err)
+			assert.NotNil(t, req)
+			assert.NotNil(t, req.Location)
+			assert.Equal(t, RegionUnknown, req.Location.Region)
+		})
+	}
 }
 
 func TestGetProviderLocation(t *testing.T) {

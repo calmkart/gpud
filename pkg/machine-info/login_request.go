@@ -14,7 +14,18 @@ import (
 	"github.com/leptonai/gpud/pkg/providers"
 )
 
+// RegionUnknown is reported as the login request region when neither the
+// provider metadata (e.g., IMDS unsupported or unreachable) nor the
+// DERP-latency fallback produced one. Matches the "unknown" provider
+// convention in GetProvider, and gives downstream consumers (e.g., node
+// region label propagation) a stable non-empty value.
+const RegionUnknown = "unknown"
+
 func CreateLoginRequest(token string, machineID string, nodeGroup string, gpuCount string, nvmlInstance nvidianvml.Instance) (*apiv1.LoginRequest, error) {
+	return CreateLoginRequestWithRegion(token, machineID, nodeGroup, gpuCount, "", nvmlInstance)
+}
+
+func CreateLoginRequestWithRegion(token string, machineID string, nodeGroup string, gpuCount string, region string, nvmlInstance nvidianvml.Instance) (*apiv1.LoginRequest, error) {
 	return createLoginRequest(
 		token,
 		machineID,
@@ -24,7 +35,7 @@ func CreateLoginRequest(token string, machineID string, nodeGroup string, gpuCou
 		netutil.PublicIP,
 		GetMachineLocation,
 		GetMachineInfo,
-		GetProvider,
+		func(ip string) *providers.Info { return getProviderForLogin(ip, region) },
 		GetSystemResourceRootVolumeTotal,
 		GetSystemResourceGPUCount,
 	)
@@ -77,6 +88,14 @@ func createLoginRequest(
 	log.Logger.Debugw("detected public IP", "publicIP", req.Network.PublicIP)
 
 	detectedProvider := getProviderFunc(req.Network.PublicIP)
+	if detectedProvider.IMDSDetected {
+		if strings.TrimSpace(detectedProvider.InstanceID) == "" {
+			return nil, fmt.Errorf("provider %q IMDS did not return an instance ID after retries; aborting login", detectedProvider.Provider)
+		}
+		if region := strings.TrimSpace(detectedProvider.Region); region == "" || strings.EqualFold(region, RegionUnknown) {
+			return nil, fmt.Errorf("provider %q IMDS did not return a region after retries; set one with gpud up --region", detectedProvider.Provider)
+		}
+	}
 	log.Logger.Debugw("provider detection completed",
 		"provider", detectedProvider.Provider,
 		"providerInstanceID", detectedProvider.InstanceID,
@@ -150,6 +169,18 @@ func createLoginRequest(
 		req.Location = providerLocation
 	} else if machineLocationCh != nil {
 		req.Location = <-machineLocationCh
+	}
+
+	// Never report an empty region: when the provider metadata lookup
+	// failed or is unsupported AND the DERP-latency fallback also failed,
+	// mark the region "unknown" so downstream region consumers (e.g.,
+	// node region label propagation) see a stable value instead of "".
+	// An explicit gpud up region is applied before this request is built.
+	if req.Location == nil {
+		req.Location = &apiv1.MachineLocation{}
+	}
+	if strings.TrimSpace(req.Location.Region) == "" {
+		req.Location.Region = RegionUnknown
 	}
 
 	return req, nil
