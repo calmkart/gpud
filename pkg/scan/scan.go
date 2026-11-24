@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"time"
 
 	apiv1 "github.com/leptonai/gpud/api/v1"
 	cmdcommon "github.com/leptonai/gpud/cmd/common"
@@ -12,6 +13,7 @@ import (
 	nvidiainfiniband "github.com/leptonai/gpud/components/accelerator/nvidia/infiniband"
 	"github.com/leptonai/gpud/components/all"
 	nvidiacommon "github.com/leptonai/gpud/pkg/config/common"
+	pkgfirmware "github.com/leptonai/gpud/pkg/firmware"
 	"github.com/leptonai/gpud/pkg/log"
 	pkgmachineinfo "github.com/leptonai/gpud/pkg/machine-info"
 	nvidianvml "github.com/leptonai/gpud/pkg/nvidia/nvml"
@@ -26,6 +28,17 @@ func printSummary(result components.CheckResult) {
 	}
 	fmt.Printf("%s %s\n", header, result.Summary())
 	fmt.Println(result.String())
+	// One-shot scans have no health API consumer. Preserve query errors and
+	// recovery guidance here as well as in daemon health responses.
+	for _, state := range result.HealthStates() {
+		if state.Error != "" {
+			fmt.Printf("%s error: %s\n", state.Component, state.Error)
+		}
+		if state.SuggestedActions != nil {
+			fmt.Printf("%s suggested actions: %v %s\n", state.Component,
+				state.SuggestedActions.RepairActions, state.SuggestedActions.Description)
+		}
+	}
 	println()
 }
 
@@ -58,6 +71,12 @@ func Scan(ctx context.Context, opts ...OpOption) error {
 		return err
 	}
 
+	// This one-shot process has no background collector, so read firmware now.
+	pkgfirmware.RefreshWithin(ctx, pkgfirmware.Options{
+		NVMLInstance:           nvmlInstance,
+		InfinibandClassRootDir: op.infinibandClassRootDir,
+	}, time.Minute)
+
 	mi, err := pkgmachineinfo.GetMachineInfo(nvmlInstance)
 	if err != nil {
 		return err
@@ -71,7 +90,11 @@ func Scan(ctx context.Context, opts ...OpOption) error {
 		providerInfo.RenderTable(os.Stdout)
 	}
 
-	if mi.GPUInfo != nil && mi.GPUInfo.Product != "" {
+	if op.infinibandExpectedPortStates != nil {
+		// Development Rubin trays need not match the reference NVL72 NIC layout.
+		// Never replace an explicit inventory (including zero) with a SKU default.
+		nvidiainfiniband.SetDefaultExpectedPortStates(*op.infinibandExpectedPortStates)
+	} else if mi.GPUInfo != nil && mi.GPUInfo.Product != "" {
 		threshold, err := nvidiainfiniband.SupportsInfinibandPortRate(mi.GPUInfo.Product)
 		if err == nil {
 			log.Logger.Infow("setting default expected port states", "product", mi.GPUInfo.Product, "at_least_ports", threshold.AtLeastPorts, "at_least_rate", threshold.AtLeastRate)

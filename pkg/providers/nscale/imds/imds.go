@@ -51,7 +51,12 @@ func fetchMetadataByPath(ctx context.Context, metadataURL string) (string, error
 
 func fetchMetadataByPathWithStatusCode(ctx context.Context, metadataURL string) (string, int, error) {
 	client := &http.Client{
-		Timeout: 5 * time.Second,
+		// The first TCP connection to the metadata service after an idle
+		// period can take several seconds to establish on nscale (observed
+		// >5s on production nodes; warm connects are sub-millisecond).
+		// A 5s timeout loses that race; 10s covers the cold connect while
+		// staying well within the caller's overall detection budget.
+		Timeout: 10 * time.Second,
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metadataURL, nil)
@@ -103,23 +108,35 @@ func FetchInstanceID(ctx context.Context) (string, error) {
 }
 
 func FetchOpenStackMetadata(ctx context.Context) (*OpenStackMetadataResponse, error) {
-	return fetchOpenStackMetadata(ctx, openStackMetadataJSONURL)
+	resp, _, err := FetchOpenStackMetadataWithStatusCode(ctx)
+	return resp, err
+}
+
+func FetchOpenStackMetadataWithStatusCode(ctx context.Context) (*OpenStackMetadataResponse, int, error) {
+	return fetchOpenStackMetadataWithStatusCode(ctx, openStackMetadataJSONURL)
 }
 
 func fetchOpenStackMetadata(ctx context.Context, metadataURL string) (*OpenStackMetadataResponse, error) {
-	d, err := fetchMetadataByPath(ctx, metadataURL)
+	resp, _, err := fetchOpenStackMetadataWithStatusCode(ctx, metadataURL)
+	return resp, err
+}
+
+func fetchOpenStackMetadataWithStatusCode(ctx context.Context, metadataURL string) (*OpenStackMetadataResponse, int, error) {
+	d, code, err := fetchMetadataByPathWithStatusCode(ctx, metadataURL)
 	if err != nil {
-		return nil, err
+		return nil, code, err
 	}
 
 	resp := &OpenStackMetadataResponse{}
 	if err := json.Unmarshal([]byte(d), resp); err != nil {
-		return nil, fmt.Errorf("failed to parse OpenStack metadata: %w", err)
+		return nil, code, fmt.Errorf("failed to parse OpenStack metadata: %w", err)
 	}
-	return resp, nil
+	return resp, code, nil
 }
 
-// FetchRegion returns a human-readable nscale region from OpenStack metadata.
+// FetchRegion returns a human-readable nscale region from OpenStack metadata,
+// or an empty string with no error when metadata only contains an opaque
+// region UUID or the generic "nova" availability zone.
 // ref. https://docs.openstack.org/nova/latest/user/metadata.html
 func FetchRegion(ctx context.Context) (string, error) {
 	return fetchRegion(ctx, openStackMetadataJSONURL)
@@ -143,5 +160,5 @@ func fetchRegion(ctx context.Context, metadataURL string) (string, error) {
 		}
 		return candidate, nil
 	}
-	return "", fmt.Errorf("nscale metadata has no usable region; set one with gpud up --region")
+	return "", nil
 }

@@ -1,3 +1,48 @@
+{{- $containerd := .Values.gpud.containerd | default dict -}}
+{{- $explicitRuntime := or $containerd.endpoint $containerd.configPath $containerd.serviceName $containerd.systemctlCommands -}}
+{{- /*
+RKE2 and K3s embed containerd in their own systemd unit, with the socket under
+/run/k3s/containerd and the config under /var/lib/rancher/<distro>, so the
+stock defaults find no containerd and the check is skipped. The distro shows up
+only in the server version suffix (e.g. v1.36.3+rke2r1), so detection needs Helm
+to render against a live API server rather than with --client-only. Any
+explicit gpud.containerd value disables detection.
+*/ -}}
+{{- $distro := "" -}}
+{{- if not $explicitRuntime -}}
+{{- if contains "+rke2" .Capabilities.KubeVersion.Version -}}
+{{- $distro = "rke2" -}}
+{{- else if contains "+k3s" .Capabilities.KubeVersion.Version -}}
+{{- $distro = "k3s" -}}
+{{- end -}}
+{{- end -}}
+{{- $endpoint := $containerd.endpoint | default "unix:///run/containerd/containerd.sock" -}}
+{{- $configPath := $containerd.configPath | default "/etc/containerd/config.toml" -}}
+{{- $serviceName := $containerd.serviceName | default "containerd" -}}
+{{- if $distro -}}
+{{- $endpoint = "unix:///run/k3s/containerd/containerd.sock" -}}
+{{- $configPath = printf "/var/lib/rancher/%s/agent/etc/containerd/config.toml" $distro -}}
+{{- /* Agent nodes run containerd under the agent unit, server nodes under the server unit. */ -}}
+{{- $serviceName = ternary "rke2-agent,rke2-server" "k3s-agent,k3s" (eq $distro "rke2") -}}
+{{- end -}}
+{{- $configuredRuntime := or $explicitRuntime $distro -}}
+{{- if not (hasPrefix "unix:///" $endpoint) -}}
+{{- fail "gpud.containerd.endpoint must be unix:///absolute/socket/path" -}}
+{{- end -}}
+{{- $socketPath := trimPrefix "unix://" $endpoint -}}
+{{- if or (eq (clean $socketPath) "/") (contains "?" $socketPath) (contains "#" $socketPath) (contains "%" $socketPath) -}}
+{{- fail "gpud.containerd.endpoint must name an absolute socket path without URL escapes, query or fragment" -}}
+{{- end -}}
+{{- if or (not (hasPrefix "/" $configPath)) (eq (clean $configPath) "/") -}}
+{{- fail "gpud.containerd.configPath must be an absolute file path" -}}
+{{- end -}}
+{{- $activeCommands := .Values.gpud.containerdServiceActiveCommands -}}
+{{- if eq $activeCommands nil -}}
+{{- $activeCommands = "" -}}
+{{- if not $configuredRuntime -}}
+{{- $activeCommands = "nsenter --target 1 --mount -- systemctl is-active containerd" -}}
+{{- end -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -159,9 +204,22 @@ spec:
             path: /var/lib/kubelet
             type: DirectoryOrCreate
 
+        # Rancher (k3s/RKE2) agent directory for kubelet client credentials
+        # Required by: components/containerd dangling pod detection, which reads
+        # kubelet.kubeconfig + referenced client certificate/CA from this tree on
+        # Rancher-provisioned nodes (e.g. BYOK worker clusters)
+        # DirectoryOrCreate so the pod still starts on non-Rancher nodes.
+        - name: host-rancher-vol
+          hostPath:
+            path: /var/lib/rancher
+            type: DirectoryOrCreate
+
         {{- if .Values.gpud.mountNVIDIADriverRoot }}
         # GPU Operator installs its driver libraries under this host path.
-        # On preinstalled-driver nodes this may be empty; gpud then preserves its
+        # gpud probes this well-known container path automatically when the
+        # mount is present -- no environment variable is needed because the
+        # path is fixed here and the mount is on by default. On
+        # preinstalled-driver nodes this may be empty; gpud then preserves its
         # normal system-library lookup.
         - name: host-nvidia-driver
           hostPath:
@@ -169,23 +227,36 @@ spec:
             type: DirectoryOrCreate
         {{- end }}
 
+        {{- if .Values.gpud.mountHostRoot }}
+        # Host root filesystem, exposing pre-installed NVIDIA driver libraries
+        # under /host/usr/lib*. Same "host-root" pattern as the GPU Operator's
+        # DRA driver DaemonSet. gpud probes this well-known path automatically
+        # (before the driver root, so a pre-installed host driver wins),
+        # including the Operator's driver-ready contract at
+        # /host/run/nvidia/validations/driver-ready -- again with no
+        # environment variable, since the mount path is fixed.
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory
+        {{- end }}
+
         {{- if .Values.gpud.mountContainerd }}
         # Host containerd runtime directory (holds containerd.sock).
-        # Required by: components/containerd (stat the socket and reach the CRI
-        # endpoint at unix:///run/containerd/containerd.sock).
+        # Required by: components/containerd (stat the socket and reach the CRI endpoint).
         # DirectoryOrCreate so the pod still starts on nodes without containerd.
-        # Disable via gpud.mountContainerd=false on nodes without containerd.
+        # Disabling this mount does not disable the component.
         - name: host-run-containerd
           hostPath:
-            path: /run/containerd
+            path: {{ dir $socketPath | quote }}
             type: DirectoryOrCreate
 
         # Host containerd config directory (holds config.toml).
-        # Required by: components/containerd (read /etc/containerd/config.toml to
+        # Required by: components/containerd (read the selected config to
         # verify the NVIDIA runtime is configured). Mounted read-only.
         - name: host-etc-containerd
           hostPath:
-            path: /etc/containerd
+            path: {{ dir $configPath | quote }}
             type: DirectoryOrCreate
         {{- end }}
 
@@ -202,6 +273,20 @@ spec:
         - name: host-run-crio
           hostPath:
             path: /run/crio
+            type: DirectoryOrCreate
+        {{- end }}
+
+        {{- if .Values.gpud.nvsentinel.enabled }}
+        # Host NVSentinel directory, shared with the NVSentinel
+        # platform-connector pod (which mounts the same host directory). gpud
+        # creates its PlatformConnector gRPC unix socket at
+        # gpud.nvsentinel.socketPath here; the connector dials it. Requires
+        # gpud v0.13.0+ (LEP-6075). DirectoryOrCreate so the pod starts on
+        # nodes without NVSentinel: gpud then idles on the socket and the
+        # connector, when it appears, finds and dials it.
+        - name: nvsentinel-run
+          hostPath:
+            path: {{ dir .Values.gpud.nvsentinel.socketPath }}
             type: DirectoryOrCreate
         {{- end }}
       {{- if .Values.extraVolumes }}
@@ -356,6 +441,9 @@ spec:
               set -- run
               set -- "$@" --listen-address="{{ .Values.gpud.listenAddress }}"
               set -- "$@" --log-level="{{ .Values.gpud.logLevel }}"
+              # Profile updates restart gpud. Keep the specs on the existing
+              # hostPath so both container restarts and pod replacement reload them.
+              set -- "$@" --plugin-specs-file=/var/lib/gpud/gpud.plugins.yaml --plugin-specs-file-managed
 
               # Endpoint priority: Node label > values.yaml > (none)
               ENDPOINT="{{ .Values.gpud.endpoint }}"
@@ -368,22 +456,36 @@ spec:
 
               # A token Secret (gpud.tokenSecret) is injected as GPUD_TOKEN and
               # takes priority over any token node label. This supports clusters
-              # that store the gpud session token in a Secret rather than a label.
+              # that store the enrollment token in a Secret rather than a label.
               if [ -n "${GPUD_TOKEN:-}" ]; then
                 TOKEN="$GPUD_TOKEN"
               fi
 
               # Token vs machine-id are intentionally sourced differently:
-              #   --token: a SHARED, cluster/node-group enrollment credential
+              #   GPUD_TOKEN: a SHARED, cluster/node-group enrollment credential
               #     ("may I join?"). Every node uses the same token (from the
               #     gpud.tokenSecret Secret, or a token label). It does NOT
               #     identify the machine.
               #   --machine-id: the UNIQUE per-node identity ("who am I?"), read
               #     from each node's machine-id label. Passing it keeps the node
               #     registered as the SAME machine across restarts/replacement.
+              # Pass the credential through the environment so neither the startup
+              # log nor the process argument list contains its value.
+              token_status="unset"
               if [ -n "$TOKEN" ]; then
-                set -- "$@" --token="$TOKEN"
+                # An overridden older image could silently skip enrollment.
+                # Check the advertised capability before handing it a credential.
+                if ! GPUD_TOKEN= /usr/local/bin/gpud up --help 2>/dev/null | grep -q GPUD_TOKEN; then
+                  echo "this gpud image does not read GPUD_TOKEN; use the image from the same release" >&2
+                  exit 1
+                fi
+                export GPUD_TOKEN="$TOKEN"
+                token_status="set"
+              else
+                # Leave tokenless starts without a credential in the environment.
+                unset GPUD_TOKEN
               fi
+              unset TOKEN
               if [ -n "$MID" ]; then
                 set -- "$@" --machine-id="$MID"
               fi
@@ -403,18 +505,32 @@ spec:
                 set -- "$@" --refresh-session-token
               fi
 
+              if [ "${GPUD_REQUIRE_NVIDIA_DRIVER:-}" = "true" ]; then
+                set -- "$@" --require-nvidia-driver
+              fi
+
+              if [ -n "${GPUD_REGION:-}" ]; then
+                set -- "$@" --region="$GPUD_REGION"
+              fi
+
+              if [ -n "${GPUD_COMPONENTS:-}" ]; then
+                set -- "$@" --components="$GPUD_COMPONENTS"
+              fi
+
               set -- "$@" --enable-auto-update={{ .Values.gpud.enableAutoUpdate }}
               set -- "$@" --auto-update-exit-code={{ .Values.gpud.autoUpdateExitCode }}
 
-              # Log the command for debugging, then exec to replace shell with gpud.
-              # Keep the multi-line reboot script out of the startup log; gpud logs it
-              # when a reboot request actually schedules and executes it.
-              start_log_args="$*"
+              {{- if .Values.gpud.nvsentinel.enabled }}
+              # NVSentinel sink: serve the PlatformConnector gRPC API on this unix
+              # socket. This is a pure listener -- it never dials NVSentinel, so it
+              # is safe on nodes without NVSentinel and simply receives events
+              # whenever a platform-connector comes online and starts forwarding.
+              set -- "$@" --nvsentinel-endpoint="{{ .Values.gpud.nvsentinel.socketPath }}"
+              {{- end }}
 
               # The chart default sets a host-namespace reboot script. Users can
               # set gpud.rebootCommands="" to preserve gpud's built-in sudo reboot path.
               if [ -n "${GPUD_REBOOT_COMMANDS:-}" ]; then
-                start_log_args="$start_log_args --reboot-commands=<set>"
                 set -- "$@" --reboot-commands="$GPUD_REBOOT_COMMANDS"
               fi
 
@@ -423,15 +539,12 @@ spec:
               # overlay. Users can set the corresponding gpud.*Commands value to
               # "" to preserve gpud's built-in in-namespace behavior.
               if [ -n "${GPUD_FINDMNT_COMMANDS:-}" ]; then
-                start_log_args="$start_log_args --findmnt-commands=<set>"
                 set -- "$@" --findmnt-commands="$GPUD_FINDMNT_COMMANDS"
               fi
               if [ -n "${GPUD_LSBLK_COMMANDS:-}" ]; then
-                start_log_args="$start_log_args --lsblk-commands=<set>"
                 set -- "$@" --lsblk-commands="$GPUD_LSBLK_COMMANDS"
               fi
               if [ -n "${GPUD_BLOCKDEV_USAGE_COMMANDS:-}" ]; then
-                start_log_args="$start_log_args --blockdev-usage-commands=<set>"
                 set -- "$@" --blockdev-usage-commands="$GPUD_BLOCKDEV_USAGE_COMMANDS"
               fi
 
@@ -442,30 +555,30 @@ spec:
               # without preventing this DaemonSet pod from starting. Systemd
               # installations do not use this Helm-only default.
               if [ -n "${GPUD_NFS_HOST_ROOT:-}" ]; then
-                start_log_args="$start_log_args --nfs-host-root=$GPUD_NFS_HOST_ROOT"
                 set -- "$@" --nfs-host-root="$GPUD_NFS_HOST_ROOT"
               fi
               if [ -n "${GPUD_CONTAINERD_SERVICE_ACTIVE_COMMANDS:-}" ]; then
-                start_log_args="$start_log_args --containerd-service-active-commands=<set>"
                 set -- "$@" --containerd-service-active-commands="$GPUD_CONTAINERD_SERVICE_ACTIVE_COMMANDS"
               fi
 
+              {{- if $configuredRuntime }}
+              set -- "$@" --containerd-endpoint="$GPUD_CONTAINERD_ENDPOINT" \
+                --containerd-config-path="$GPUD_CONTAINERD_CONFIG_PATH" \
+                --containerd-service-name="$GPUD_CONTAINERD_SERVICE_NAME" \
+                --containerd-systemctl-commands="$GPUD_CONTAINERD_SYSTEMCTL_COMMANDS"
+              {{- end }}
+
               # Using exec ensures gpud receives signals directly (important for graceful shutdown).
-              echo "Starting: /usr/local/bin/gpud $start_log_args"
+              # Never reconstruct a log from argv: future flags can carry secrets too.
+              printf 'Starting: /usr/local/bin/gpud run (token=<%s>)\n' "$token_status"
               exec /usr/local/bin/gpud "$@"
 {{- end }}
 
           env:
             - name: GPUD_NO_USAGE_STATS
               value: {{ not .Values.gpud.telemetry.enabled | quote }}
-            {{- if .Values.gpud.mountNVIDIADriverRoot }}
-            # Opt in to the GPU Operator driver-root fallback. Bare-metal/systemd
-            # runs do not receive this environment variable.
-            - name: GPUD_NVIDIA_DRIVER_ROOT
-              value: /run/nvidia/driver
-            {{- end }}
             {{- if .Values.gpud.tokenSecret.name }}
-            # Session token sourced from an existing Secret (takes priority over a
+            # Enrollment token sourced from an existing Secret (takes priority over a
             # token node label). Consumed by the startup script as $GPUD_TOKEN.
             - name: GPUD_TOKEN
               valueFrom:
@@ -484,6 +597,22 @@ spec:
             # Consumed as $GPUD_REFRESH_SESSION_TOKEN.
             - name: GPUD_REFRESH_SESSION_TOKEN
               value: "true"
+            {{- end }}
+            {{- if .Values.gpud.requireNVIDIADriver }}
+            # BYOK: do not register NVIDIA GPU hardware until the driver and
+            # NVML are available. CPU-only nodes are unaffected.
+            - name: GPUD_REQUIRE_NVIDIA_DRIVER
+              value: "true"
+            {{- end }}
+            {{- if .Values.gpud.region }}
+            - name: GPUD_REGION
+              value: {{ .Values.gpud.region | quote }}
+            {{- end }}
+            {{- if .Values.gpud.components }}
+            # Component selection, consumed by the startup script as
+            # $GPUD_COMPONENTS and passed to "gpud run --components".
+            - name: GPUD_COMPONENTS
+              value: {{ include "gpud.componentsArg" . | quote }}
             {{- end }}
             {{- if .Values.gpud.rebootCommands }}
             - name: GPUD_REBOOT_COMMANDS
@@ -507,9 +636,22 @@ spec:
             - name: GPUD_NFS_HOST_ROOT
               value: {{ .Values.gpud.nfsHostRoot | quote }}
             {{- end }}
-            {{- if .Values.gpud.containerdServiceActiveCommands }}
+            {{- if $activeCommands }}
             - name: GPUD_CONTAINERD_SERVICE_ACTIVE_COMMANDS
-              value: {{ .Values.gpud.containerdServiceActiveCommands | quote }}
+              value: {{ $activeCommands | quote }}
+            {{- end }}
+            {{- if $configuredRuntime }}
+            - name: GPUD_CONTAINERD_ENDPOINT
+              value: {{ $endpoint | quote }}
+            - name: GPUD_CONTAINERD_CONFIG_PATH
+              value: {{ $configPath | quote }}
+            - name: GPUD_CONTAINERD_SERVICE_NAME
+              value: {{ $serviceName | quote }}
+            - name: GPUD_CONTAINERD_SYSTEMCTL_COMMANDS
+              value: {{ $containerd.systemctlCommands | default "nsenter --target 1 --mount -- systemctl" | quote }}
+            {{- end }}
+            {{- with .Values.gpud.extraEnv }}
+            {{- toYaml . | nindent 12 }}
             {{- end }}
 
           {{- if .Values.service.enabled }}
@@ -522,9 +664,21 @@ spec:
               protocol: TCP
           {{- end }}
 
+          {{- if .Values.livenessProbe }}
+          {{- if not .Values.startupProbe }}
+          {{- fail "startupProbe is required when livenessProbe is enabled; gpud performs login and machine-info collection before /healthz starts" }}
+          {{- end }}
           livenessProbe:
             {{- toYaml .Values.livenessProbe | nindent 12 }}
+          {{- end }}
           # No readinessProbe is defined
+          {{- with .Values.startupProbe }}
+          # Gives slow control-plane login/machine-info time to finish before
+          # the liveness probe starts (liveness stays off until the first
+          # successful startup probe). Disabling requires livenessProbe: null too.
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           {{- with .Values.resources }}
           # Omitted entirely when values sets "resources: null", so the
           # DaemonSet consumes none of the node's allocatable resources.
@@ -599,25 +753,44 @@ spec:
               mountPath: /var/lib/kubelet
               readOnly: true
 
+            # Rancher agent data for kubelet client credentials (read-only)
+            # Holds kubelet.kubeconfig + client certs on k3s/RKE2 nodes
+            - name: host-rancher-vol
+              mountPath: /var/lib/rancher
+              readOnly: true
+
             {{- if .Values.gpud.mountNVIDIADriverRoot }}
             # GPU Operator-managed driver libraries. Read-only because gpud only
             # loads NVML and never modifies the driver installation.
+            # HostToContainer so an Operator driver (re)install that creates
+            # mounts under /run/nvidia/driver is visible without a pod restart.
             - name: host-nvidia-driver
               mountPath: /run/nvidia/driver
               readOnly: true
+              mountPropagation: HostToContainer
+            {{- end }}
+
+            {{- if .Values.gpud.mountHostRoot }}
+            # Pre-installed host driver libraries under /host/usr/lib*.
+            # Read-only; HostToContainer mirrors the GPU Operator's DRA driver
+            # DaemonSet so host driver changes propagate into the container.
+            - name: host-root
+              mountPath: /host
+              readOnly: true
+              mountPropagation: HostToContainer
             {{- end }}
 
             {{- if .Values.gpud.mountContainerd }}
             # Host containerd socket directory for containerd monitoring.
-            # Mounted at the same path gpud expects (/run/containerd/containerd.sock).
+            # Mounted at the selected endpoint's parent directory.
             # Not read-only: connecting to the CRI unix socket requires write access.
             - name: host-run-containerd
-              mountPath: /run/containerd
+              mountPath: {{ dir $socketPath | quote }}
 
             # Host containerd config for the NVIDIA-runtime check (read-only).
-            # Mounted at the same path gpud reads (/etc/containerd/config.toml).
+            # Mounted at the selected config's parent directory.
             - name: host-etc-containerd
-              mountPath: /etc/containerd
+              mountPath: {{ dir $configPath | quote }}
               readOnly: true
             {{- end }}
 
@@ -628,6 +801,13 @@ spec:
             # socket requires write access (same reason /run/containerd is rw).
             - name: host-run-crio
               mountPath: /run/crio
+            {{- end }}
+
+            {{- if .Values.gpud.nvsentinel.enabled }}
+            # Host NVSentinel directory shared with the platform-connector pod.
+            # Not read-only: gpud creates/removes its unix socket file here.
+            - name: nvsentinel-run
+              mountPath: {{ dir .Values.gpud.nvsentinel.socketPath }}
             {{- end }}
           {{- if .Values.extraVolumeMounts }}
           {{- toYaml .Values.extraVolumeMounts | nindent 12 }}

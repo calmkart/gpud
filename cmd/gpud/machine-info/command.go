@@ -8,8 +8,10 @@ import (
 
 	"github.com/urfave/cli"
 
+	apiv1 "github.com/leptonai/gpud/api/v1"
 	cmdcommon "github.com/leptonai/gpud/cmd/common"
 	gpudcommon "github.com/leptonai/gpud/cmd/gpud/common"
+	pkgfirmware "github.com/leptonai/gpud/pkg/firmware"
 	"github.com/leptonai/gpud/pkg/log"
 	pkgmachineinfo "github.com/leptonai/gpud/pkg/machine-info"
 	pkgmetadata "github.com/leptonai/gpud/pkg/metadata"
@@ -82,6 +84,9 @@ func Command(cliContext *cli.Context) error {
 		return wrapErr("failed_to_initialize_nvml", err)
 	}
 
+	// This one-shot process has no background collector, so read firmware now.
+	pkgfirmware.RefreshWithin(context.Background(), pkgfirmware.Options{NVMLInstance: nvmlInstance}, time.Minute)
+
 	machineInfo, err := pkgmachineinfo.GetMachineInfo(nvmlInstance)
 	if err != nil {
 		return wrapErr("failed_to_get_machine_info", err)
@@ -97,19 +102,15 @@ func Command(cliContext *cli.Context) error {
 			fmt.Printf("%s failed to find provider (%v)\n", cmdcommon.WarningSign, err)
 		}
 	} else {
-		if providerInfo.PrivateIP == "" {
-			if machineInfo != nil && machineInfo.NICInfo != nil {
-				for _, iface := range machineInfo.NICInfo.PrivateIPInterfaces {
-					if iface.IP == "" {
-						continue
-					}
-					if iface.Addr.IsPrivate() && iface.Addr.Is4() {
-						providerInfo.PrivateIP = iface.IP
-						break
-					}
-				}
-			}
+		var nicInfo *apiv1.MachineNICInfo
+		if machineInfo != nil {
+			nicInfo = machineInfo.NICInfo
 		}
+		publicIPForPrivateSelection := providerInfo.PublicIP
+		if publicIPForPrivateSelection == "" {
+			publicIPForPrivateSelection = pubIP
+		}
+		providerInfo.PrivateIP = pkgmachineinfo.SelectPrivateIP(providerInfo.PrivateIP, publicIPForPrivateSelection, nicInfo)
 		// Match LoginRequest behavior: when provider metadata cannot provide
 		// a usable region, use DERP/latency-derived machine location.
 		if providerInfo.Region == "" {

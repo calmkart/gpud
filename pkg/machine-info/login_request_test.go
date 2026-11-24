@@ -7,7 +7,6 @@ import (
 	"os"
 	"testing"
 
-	"github.com/bytedance/mockey"
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -139,13 +138,13 @@ func TestCreateLoginRequest_FailsFastOnMissingRequiredIMDSIdentity(t *testing.T)
 			wantErr: "did not return an instance ID",
 		},
 		{
-			name:    "missing region",
-			info:    &providers.Info{Provider: "nscale", InstanceID: "instance-1", IMDSDetected: true},
+			name:    "missing region on non-nscale IMDS provider",
+			info:    &providers.Info{Provider: "aws", InstanceID: "instance-1", IMDSDetected: true},
 			wantErr: "did not return a region",
 		},
 		{
-			name:    "unknown region",
-			info:    &providers.Info{Provider: "nscale", Region: RegionUnknown, InstanceID: "instance-1", IMDSDetected: true},
+			name:    "unknown region on non-nscale IMDS provider",
+			info:    &providers.Info{Provider: "aws", Region: RegionUnknown, InstanceID: "instance-1", IMDSDetected: true},
 			wantErr: "did not return a region",
 		},
 	} {
@@ -162,10 +161,49 @@ func TestCreateLoginRequest_FailsFastOnMissingRequiredIMDSIdentity(t *testing.T)
 				func(string) *providers.Info { return tc.info },
 				func() (string, error) { return "", nil },
 				func(nvidianvml.Instance) (string, error) { return "0", nil },
+				noDefaultRouteHostIPv4,
 			)
 			assert.ErrorContains(t, err, tc.wantErr)
 			assert.Nil(t, req)
 			assert.False(t, machineInfoCalled)
+		})
+	}
+}
+
+func TestCreateLoginRequest_PublicIPExclusion(t *testing.T) {
+	for _, tc := range []struct {
+		name, egress, reported, route, private string
+	}{
+		{"unknown public address excludes matching egress", "1.2.3.4", "", "1.2.3.4", ""},
+		{"metadata address wins over different egress", "9.9.9.9", "1.2.3.4", "1.2.3.4", ""},
+		{"non-RFC1918 internal route is retained", "9.9.9.9", "", "7.246.0.10", "7.246.0.10"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := createLoginRequest(
+				"token", "machine-id", "node-group", "0", &mockNvmlInstance{},
+				func() (string, error) { return tc.egress, nil },
+				func() *apiv1.MachineLocation { return nil },
+				func(nvidianvml.Instance) (*apiv1.MachineInfo, error) {
+					return &apiv1.MachineInfo{
+						CPUInfo:    &apiv1.MachineCPUInfo{LogicalCores: 4},
+						MemoryInfo: &apiv1.MachineMemoryInfo{TotalBytes: 1024},
+						NICInfo:    &apiv1.MachineNICInfo{},
+					}, nil
+				},
+				func(string) *providers.Info {
+					return &providers.Info{Provider: "nebius", PublicIP: tc.reported, Region: "eu-north1", InstanceID: "instance-1", IMDSDetected: true}
+				},
+				func() (string, error) { return "100Gi", nil },
+				func(nvidianvml.Instance) (string, error) { return "0", nil },
+				func() (netutil.InterfaceAddr, error) {
+					return netutil.InterfaceAddr{Addr: netip.MustParseAddr(tc.route)}, nil
+				},
+			)
+			if !assert.NoError(t, err) {
+				return
+			}
+			assert.Equal(t, tc.reported, req.Network.PublicIP)
+			assert.Equal(t, tc.private, req.Network.PrivateIP)
 		})
 	}
 }
@@ -196,11 +234,48 @@ func TestCreateLoginRequest_ValidIMDSIdentitySkipsDERP(t *testing.T) {
 		},
 		func() (string, error) { return "100Gi", nil },
 		func(nvidianvml.Instance) (string, error) { return "0", nil },
+		noDefaultRouteHostIPv4,
 	)
 	assert.NoError(t, err)
 	assert.False(t, locationCalled)
 	assert.Equal(t, "eu-west-2", req.Location.Region)
 	assert.Equal(t, "instance-1", req.ProviderInstanceID)
+}
+
+func TestCreateLoginRequest_NscaleWithoutMetadataRegionFallsBackToDERP(t *testing.T) {
+	locationCalled := false
+	req, err := createLoginRequest(
+		"token", "machine-id", "node-group", "0", &mockNvmlInstance{},
+		func() (string, error) { return "46.148.127.30", nil },
+		func() *apiv1.MachineLocation {
+			locationCalled = true
+			return &apiv1.MachineLocation{Region: "eu-west-2"}
+		},
+		func(nvidianvml.Instance) (*apiv1.MachineInfo, error) {
+			return &apiv1.MachineInfo{
+				CPUInfo:    &apiv1.MachineCPUInfo{LogicalCores: 16},
+				MemoryInfo: &apiv1.MachineMemoryInfo{TotalBytes: 1024},
+				NICInfo:    &apiv1.MachineNICInfo{},
+			}, nil
+		},
+		func(string) *providers.Info {
+			return &providers.Info{
+				Provider:     "nscale",
+				PublicIP:     "46.148.127.30",
+				PrivateIP:    "10.42.3.242",
+				InstanceID:   "i-00003b7a",
+				IMDSDetected: true,
+			}
+		},
+		func() (string, error) { return "100Gi", nil },
+		func(nvidianvml.Instance) (string, error) { return "0", nil },
+		noDefaultRouteHostIPv4,
+	)
+	assert.NoError(t, err)
+	assert.True(t, locationCalled)
+	assert.Equal(t, "eu-west-2", req.Location.Region)
+	assert.Equal(t, "i-00003b7a", req.ProviderInstanceID)
+	assert.Equal(t, "10.42.3.242", req.Network.PrivateIP)
 }
 
 func TestCreateLoginRequest_Basic(t *testing.T) {
@@ -249,7 +324,7 @@ func TestCreateLoginRequest_Basic(t *testing.T) {
 				}, nil
 			},
 			getProviderFunc: func(ip string) *providers.Info {
-				return &providers.Info{Provider: "aws", PublicIP: ip}
+				return &providers.Info{Provider: "aws", PublicIP: ip, InstanceType: "p5.48xlarge"}
 			},
 			getSystemResourceRootVolumeTotalFunc: func() (string, error) {
 				return "100Gi", nil
@@ -266,6 +341,7 @@ func TestCreateLoginRequest_Basic(t *testing.T) {
 				assert.Equal(t, "1.2.3.4", req.Network.PublicIP)
 				// We don't validate PrivateIP as it depends on the result of Is4()
 				assert.Equal(t, "aws", req.Provider)
+				assert.Equal(t, "p5.48xlarge", req.ProviderInstanceType)
 				assert.Equal(t, "4", req.Resources[string(corev1.ResourceCPU)])
 				// Memory is calculated from bytes, so we need to check the actual value
 				memQty, err := resource.ParseQuantity(req.Resources[string(corev1.ResourceMemory)])
@@ -520,6 +596,7 @@ func TestCreateLoginRequest_Basic(t *testing.T) {
 				tt.getProviderFunc,
 				tt.getSystemResourceRootVolumeTotalFunc,
 				tt.getSystemResourceGPUCountFunc,
+				noDefaultRouteHostIPv4,
 			)
 
 			if tt.wantErr {
@@ -578,6 +655,7 @@ func TestCreateLoginRequest_NetworkBasics(t *testing.T) {
 		},
 		func() (string, error) { return "100Gi", nil },
 		func(nvidianvml.Instance) (string, error) { return "1", nil },
+		noDefaultRouteHostIPv4,
 	)
 
 	assert.NoError(t, err)
@@ -585,67 +663,6 @@ func TestCreateLoginRequest_NetworkBasics(t *testing.T) {
 	assert.Equal(t, "1.2.3.4", req.Network.PublicIP)
 	assert.Equal(t, "provider-1.2.3.4", req.Provider)
 	assert.Equal(t, "1", req.Resources["nvidia.com/gpu"])
-}
-
-func TestCreateLoginRequest_UsesDefaultDependenciesWithMockey(t *testing.T) {
-	mockey.PatchConvey("CreateLoginRequest wires package-level dependencies", t, func() {
-		mockey.Mock(netutil.PublicIP).To(func() (string, error) {
-			return "54.1.2.3", nil
-		}).Build()
-		mockey.Mock(GetMachineLocation).To(func() *apiv1.MachineLocation {
-			return &apiv1.MachineLocation{
-				Region: "us-west-2",
-				Zone:   "us-west-2a",
-			}
-		}).Build()
-		mockey.Mock(GetMachineInfo).To(func(nvidianvml.Instance) (*apiv1.MachineInfo, error) {
-			return &apiv1.MachineInfo{
-				CPUInfo: &apiv1.MachineCPUInfo{
-					LogicalCores: 8,
-				},
-				MemoryInfo: &apiv1.MachineMemoryInfo{
-					TotalBytes: 64 * 1024 * 1024 * 1024,
-				},
-				NICInfo: &apiv1.MachineNICInfo{},
-			}, nil
-		}).Build()
-		mockey.Mock(getProviderForLogin).To(func(ip, region string) *providers.Info {
-			return &providers.Info{
-				Provider:   "aws",
-				PublicIP:   ip,
-				PrivateIP:  "172.31.0.10",
-				InstanceID: "i-mocked-instance",
-			}
-		}).Build()
-		mockey.Mock(GetSystemResourceRootVolumeTotal).To(func() (string, error) {
-			return "200Gi", nil
-		}).Build()
-		mockey.Mock(GetSystemResourceGPUCount).To(func(nvidianvml.Instance) (string, error) {
-			return "4", nil
-		}).Build()
-
-		req, err := CreateLoginRequest("token", "machine-id", "node-group", "", &mockNvmlInstance{})
-		assert.NoError(t, err)
-		if !assert.NotNil(t, req) {
-			return
-		}
-		assert.Equal(t, "token", req.Token)
-		assert.Equal(t, "machine-id", req.MachineID)
-		assert.Equal(t, "node-group", req.NodeGroup)
-		assert.Equal(t, "aws", req.Provider)
-		assert.Equal(t, "i-mocked-instance", req.ProviderInstanceID)
-		assert.Equal(t, "54.1.2.3", req.Network.PublicIP)
-		assert.Equal(t, "172.31.0.10", req.Network.PrivateIP)
-		assert.Equal(t, "8", req.Resources[string(corev1.ResourceCPU)])
-		assert.Equal(t, "200Gi", req.Resources[string(corev1.ResourceEphemeralStorage)])
-		assert.Equal(t, "4", req.Resources["nvidia.com/gpu"])
-		memQty, parseErr := resource.ParseQuantity(req.Resources[string(corev1.ResourceMemory)])
-		assert.NoError(t, parseErr)
-		assert.Equal(t, resource.NewQuantity(64*1024*1024*1024, resource.DecimalSI).String(), memQty.String())
-		assert.NotNil(t, req.Location)
-		assert.Equal(t, "us-west-2", req.Location.Region)
-		assert.Equal(t, "us-west-2a", req.Location.Zone)
-	})
 }
 
 // TestCreateLoginRequest_PrivateIPDetection tests private IP detection logic
@@ -731,6 +748,7 @@ func TestCreateLoginRequest_PrivateIPDetection(t *testing.T) {
 				func(ip string) *providers.Info { return &providers.Info{Provider: "provider"} },
 				func() (string, error) { return "100Gi", nil },
 				func(nvidianvml.Instance) (string, error) { return "1", nil },
+				noDefaultRouteHostIPv4,
 			)
 
 			assert.NoError(t, err, tt.description)
@@ -797,6 +815,7 @@ func TestCreateLoginRequest_ResourceCalculation(t *testing.T) {
 				func(ip string) *providers.Info { return &providers.Info{Provider: ""} },
 				func() (string, error) { return "100Gi", nil },
 				func(nvidianvml.Instance) (string, error) { return "0", nil },
+				noDefaultRouteHostIPv4,
 			)
 
 			assert.NoError(t, err)
@@ -956,6 +975,7 @@ func TestCreateLoginRequest_ProviderPrivateIPFallback(t *testing.T) {
 				getProviderFunc,
 				func() (string, error) { return "100Gi", nil },
 				func(nvidianvml.Instance) (string, error) { return "1", nil },
+				noDefaultRouteHostIPv4,
 			)
 
 			assert.NoError(t, err, tt.description)
@@ -1076,6 +1096,7 @@ func TestCreateLoginRequest_ProviderInfoUsage(t *testing.T) {
 				getProviderFunc,
 				func() (string, error) { return "100Gi", nil },
 				func(nvidianvml.Instance) (string, error) { return "1", nil },
+				noDefaultRouteHostIPv4,
 			)
 
 			assert.NoError(t, err)
@@ -1184,6 +1205,7 @@ func TestCreateLoginRequest_IMDSPrivateIPPrecedence(t *testing.T) {
 				getProviderFunc,
 				func() (string, error) { return "500Gi", nil },
 				func(nvidianvml.Instance) (string, error) { return "8", nil },
+				noDefaultRouteHostIPv4,
 			)
 
 			assert.NoError(t, err, tt.description)
@@ -1222,6 +1244,7 @@ func TestCreateLoginRequest_NscaleUsesLatencyLocationWithoutMetadataOverride(t *
 		getProviderFunc,
 		func() (string, error) { return "100Gi", nil },
 		func(nvidianvml.Instance) (string, error) { return "1", nil },
+		noDefaultRouteHostIPv4,
 	)
 
 	assert.NoError(t, err)
@@ -1265,6 +1288,7 @@ func TestCreateLoginRequest_ProviderRegionOverridesLatencyLocation(t *testing.T)
 		getProviderFunc,
 		func() (string, error) { return "100Gi", nil },
 		func(nvidianvml.Instance) (string, error) { return "1", nil },
+		noDefaultRouteHostIPv4,
 	)
 
 	assert.NoError(t, err)
@@ -1331,6 +1355,7 @@ func TestCreateLoginRequest_UnknownRegionFallback(t *testing.T) {
 				tc.getProviderFunc,
 				func() (string, error) { return "100Gi", nil },
 				func(nvidianvml.Instance) (string, error) { return "1", nil },
+				noDefaultRouteHostIPv4,
 			)
 
 			assert.NoError(t, err)

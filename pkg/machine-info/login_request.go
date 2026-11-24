@@ -8,6 +8,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 
 	apiv1 "github.com/leptonai/gpud/api/v1"
+	configcommon "github.com/leptonai/gpud/pkg/config/common"
 	"github.com/leptonai/gpud/pkg/log"
 	"github.com/leptonai/gpud/pkg/netutil"
 	nvidianvml "github.com/leptonai/gpud/pkg/nvidia/nvml"
@@ -22,10 +23,16 @@ import (
 const RegionUnknown = "unknown"
 
 func CreateLoginRequest(token string, machineID string, nodeGroup string, gpuCount string, nvmlInstance nvidianvml.Instance) (*apiv1.LoginRequest, error) {
-	return CreateLoginRequestWithRegion(token, machineID, nodeGroup, gpuCount, "", nvmlInstance)
+	return CreateLoginRequestWithOverrides(token, machineID, nodeGroup, gpuCount, "", "", nvmlInstance)
 }
 
-func CreateLoginRequestWithRegion(token string, machineID string, nodeGroup string, gpuCount string, region string, nvmlInstance nvidianvml.Instance) (*apiv1.LoginRequest, error) {
+// CreateLoginRequestWithOverrides applies explicit region and instance ID values only during enrollment.
+func CreateLoginRequestWithOverrides(token, machineID, nodeGroup, gpuCount, region, instanceID string, nvmlInstance nvidianvml.Instance) (*apiv1.LoginRequest, error) {
+	return CreateLoginRequestWithContainerd(token, machineID, nodeGroup, gpuCount, region, instanceID, nvmlInstance, configcommon.ContainerdConfig{})
+}
+
+// CreateLoginRequestWithContainerd uses the configured runtime for enrollment metadata.
+func CreateLoginRequestWithContainerd(token, machineID, nodeGroup, gpuCount, region, instanceID string, nvmlInstance nvidianvml.Instance, cfg configcommon.ContainerdConfig) (*apiv1.LoginRequest, error) {
 	return createLoginRequest(
 		token,
 		machineID,
@@ -34,10 +41,13 @@ func CreateLoginRequestWithRegion(token string, machineID string, nodeGroup stri
 		nvmlInstance,
 		netutil.PublicIP,
 		GetMachineLocation,
-		GetMachineInfo,
-		func(ip string) *providers.Info { return getProviderForLogin(ip, region) },
+		func(instance nvidianvml.Instance) (*apiv1.MachineInfo, error) {
+			return GetMachineInfoWithContainerd(instance, cfg)
+		},
+		func(ip string) *providers.Info { return getProviderForLogin(ip, region, instanceID) },
 		GetSystemResourceRootVolumeTotal,
 		GetSystemResourceGPUCount,
+		netutil.DefaultRouteHostIPv4,
 	)
 }
 
@@ -53,6 +63,7 @@ func createLoginRequest(
 	getProviderFunc func(ip string) *providers.Info,
 	getSystemResourceRootVolumeTotalFunc func() (string, error),
 	getSystemResourceGPUCountFunc func(nvmlInstance nvidianvml.Instance) (string, error),
+	getDefaultRouteHostIPv4Func func() (netutil.InterfaceAddr, error),
 ) (*apiv1.LoginRequest, error) {
 	donec := make(chan struct{})
 	defer close(donec)
@@ -80,20 +91,21 @@ func createLoginRequest(
 		Resources: map[string]string{},
 	}
 
-	var err error
-	req.Network.PublicIP, err = getPublicIPFunc()
+	egressIP, err := getPublicIPFunc()
 	if err != nil {
 		log.Logger.Errorw("failed to get public ip", "error", err)
 	}
-	log.Logger.Debugw("detected public IP", "publicIP", req.Network.PublicIP)
+	log.Logger.Debugw("detected egress IP", "egressIP", egressIP)
 
-	detectedProvider := getProviderFunc(req.Network.PublicIP)
+	detectedProvider := getProviderFunc(egressIP)
 	if detectedProvider.IMDSDetected {
 		if strings.TrimSpace(detectedProvider.InstanceID) == "" {
 			return nil, fmt.Errorf("provider %q IMDS did not return an instance ID after retries; aborting login", detectedProvider.Provider)
 		}
-		if region := strings.TrimSpace(detectedProvider.Region); region == "" || strings.EqualFold(region, RegionUnknown) {
-			return nil, fmt.Errorf("provider %q IMDS did not return a region after retries; set one with gpud up --region", detectedProvider.Provider)
+		if detectedProvider.Provider != "nscale" {
+			if region := strings.TrimSpace(detectedProvider.Region); region == "" || strings.EqualFold(region, RegionUnknown) {
+				return nil, fmt.Errorf("provider %q IMDS did not return a region after retries; set one with gpud up --region", detectedProvider.Provider)
+			}
 		}
 	}
 	log.Logger.Debugw("provider detection completed",
@@ -103,6 +115,7 @@ func createLoginRequest(
 
 	req.Provider = detectedProvider.Provider
 	req.ProviderInstanceID = detectedProvider.InstanceID
+	req.ProviderInstanceType = detectedProvider.InstanceType
 	providerLocation := getProviderLocation(detectedProvider)
 	if providerLocation == nil {
 		startMachineLocationLookup()
@@ -111,7 +124,6 @@ func createLoginRequest(
 	// we always prioritize the provider's public IP and private IP
 	// even if the local network interface has a private IP
 	req.Network.PublicIP = detectedProvider.PublicIP
-	req.Network.PrivateIP = detectedProvider.PrivateIP
 
 	log.Logger.Debugw("login request provider fields set",
 		"provider", req.Provider,
@@ -122,19 +134,15 @@ func createLoginRequest(
 		return nil, fmt.Errorf("failed to get machine info: %w", err)
 	}
 
-	// get the default values from the machine info
-	if req.MachineInfo != nil && req.MachineInfo.NICInfo != nil {
-		for _, iface := range req.MachineInfo.NICInfo.PrivateIPInterfaces {
-			if iface.IP == "" {
-				continue
-			}
-			if req.Network.PrivateIP == "" && iface.Addr.IsPrivate() && iface.Addr.Is4() {
-				req.Network.PrivateIP = iface.IP
-				log.Logger.Infow("provider private IP not available, using local network interface", "ip", req.Network.PrivateIP, "interface", iface.Interface)
-				break
-			}
-		}
+	var nicInfo *apiv1.MachineNICInfo
+	if req.MachineInfo != nil {
+		nicInfo = req.MachineInfo.NICInfo
 	}
+	publicIPForPrivateSelection := req.Network.PublicIP
+	if publicIPForPrivateSelection == "" {
+		publicIPForPrivateSelection = egressIP
+	}
+	req.Network.PrivateIP = selectPrivateIP(detectedProvider.PrivateIP, publicIPForPrivateSelection, nicInfo, getDefaultRouteHostIPv4Func)
 
 	if req.Network.PrivateIP == "" {
 		log.Logger.Warnw("no private ip found", "provider", req.Provider, "providerPrivateIP", detectedProvider.PrivateIP)

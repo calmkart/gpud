@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -596,6 +597,71 @@ fi
 	cancel() // Cancel immediately
 	err = runCommand(ctx, scriptPath, "version", nil)
 	assert.Error(t, err)
+}
+
+func TestRunCommandCapturesStdout(t *testing.T) {
+	scriptPath := filepath.Join(t.TempDir(), "version.sh")
+	// More stderr than fits in a pipe must not block stdout capture or become
+	// part of the version. The command exits immediately after writing stdout.
+	script := "#!/bin/bash\nprintf '%s' '" + strings.Repeat("diagnostic", 16384) + "' >&2\nprintf '1.0.0\\r\\nsecond line\\n'\n"
+	require.NoError(t, os.WriteFile(scriptPath, []byte(script), 0755))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var result string
+	require.NoError(t, runCommand(ctx, scriptPath, "version", &result))
+	require.Equal(t, "1.0.0\nsecond line", result)
+}
+
+func TestRunCommandCapturesFastExit(t *testing.T) {
+	scriptPath := filepath.Join(t.TempDir(), "version.sh")
+	require.NoError(t, os.WriteFile(scriptPath, []byte("#!/bin/bash\nprintf '1.0.0\\n'\n"), 0755))
+	for range 100 {
+		var result string
+		require.NoError(t, runCommand(context.Background(), scriptPath, "version", &result))
+		require.Equal(t, "1.0.0", result)
+	}
+}
+
+func TestRunCommandCapturesFailedCommand(t *testing.T) {
+	scriptPath := filepath.Join(t.TempDir(), "version.sh")
+	require.NoError(t, os.WriteFile(scriptPath, []byte("#!/bin/bash\nprintf 'partial output\\n'\nexit 7\n"), 0755))
+	var result string
+	require.Error(t, runCommand(context.Background(), scriptPath, "version", &result))
+	require.Equal(t, "partial output", result)
+}
+
+func TestRunCommandCaptureCanceled(t *testing.T) {
+	scriptPath := filepath.Join(t.TempDir(), "version.sh")
+	// The child inherits stdout and keeps it open after bash is killed.
+	require.NoError(t, os.WriteFile(scriptPath, []byte("#!/bin/bash\nsleep 5\nprintf 'late output\\n'\n"), 0755))
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	var result string
+	require.ErrorIs(t, runCommand(ctx, scriptPath, "version", &result), context.DeadlineExceeded)
+	require.Less(t, time.Since(started), 4*time.Second, "capture must not wait for descendants to close stdout")
+}
+
+func TestRunCommandContextCanceledDuringExecution(t *testing.T) {
+	tmpDir := t.TempDir()
+	scriptPath := filepath.Join(tmpDir, "slow.sh")
+	// A script that outlives the cancellation below.
+	scriptContent := `#!/bin/bash
+sleep 30
+`
+	require.NoError(t, os.WriteFile(scriptPath, []byte(scriptContent), 0755))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	// The command is still running when the context is canceled, so the
+	// select in runCommand takes the ctx.Done() branch.
+	err := runCommand(ctx, scriptPath, "run", nil)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
 }
 
 // TestRunCommandWithBackgroundProcessKilledByDefault demonstrates the default

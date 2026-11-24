@@ -95,7 +95,7 @@ nohup sudo gpud run &>> <your log file path> &
 				// optional, only required for logging into platform/control plane
 				cli.StringFlag{
 					Name:  "token",
-					Usage: "(optional) https://www.nvidia.com/en-us/data-center/dgx-cloud-lepton workspace token for checking in",
+					Usage: "(optional) https://www.nvidia.com/en-us/data-center/dgx-cloud-lepton workspace token for checking in (defaults to non-empty GPUD_TOKEN)",
 				},
 				cli.StringFlag{
 					Name:  "private-ip",
@@ -144,6 +144,11 @@ nohup sudo gpud run &>> <your log file path> &
 					Name:  "gpu-count",
 					Usage: "(optional) specify count of gpu (leave empty to auto-detect)",
 				},
+				cli.StringFlag{
+					Name:  "instance-id",
+					Usage: "(optional) override the provider instance ID for login only, skipping instance-ID discovery",
+					Value: "",
+				},
 			},
 		},
 		{
@@ -174,7 +179,7 @@ sudo rm /etc/systemd/system/gpud.service
 		},
 		{
 			Name:   "run",
-			Usage:  "starts gpud without any login/checkin ('gpud up' is recommended for linux) -- if --token is provided, it will perform login",
+			Usage:  "starts gpud without any login/checkin ('gpud up' is recommended for linux) -- if --token or non-empty GPUD_TOKEN is provided, it will perform login",
 			Action: cmdrun.Command,
 			Flags: []cli.Flag{
 				&cli.StringFlag{
@@ -207,10 +212,18 @@ sudo rm /etc/systemd/system/gpud.service
 					Hidden: true,
 					Usage:  "(optional) re-run login on start to fetch the current session token. Use only for BYOK deployments that supply a valid registration token on every start.",
 				},
+				&cli.BoolFlag{
+					Name:  "require-nvidia-driver",
+					Usage: "when login is configured, fail before registration if NVIDIA GPU hardware is present but the NVIDIA driver or NVML is unavailable",
+				},
 				&cli.StringFlag{
 					Name:   "token",
 					Hidden: true,
 					Usage:  "(optional) token for control plane",
+				},
+				&cli.StringFlag{
+					Name:  "region",
+					Usage: "(optional) override the region reported in the login request; skips provider-metadata and DERP-latency region detection",
 				},
 				&cli.StringFlag{
 					Name:  "log-level,l",
@@ -268,6 +281,27 @@ sudo rm /etc/systemd/system/gpud.service
 					Usage: "command used to check whether the containerd service is active (e.g. 'nsenter --target 1 --mount -- systemctl is-active containerd' to query the host service manager from inside a container; exit code 0 means active); leave empty to use the built-in systemd check",
 					Value: "",
 				},
+				cli.DurationFlag{
+					Name:  "containerd-dangling-pod-grace-period",
+					Usage: "minimum API absence before a READY sandbox counts as dangling (e.g. 10m); 0 counts on the first successful check",
+					Value: 0,
+				},
+				cli.StringFlag{
+					Name:  "containerd-endpoint",
+					Usage: "containerd CRI endpoint (empty: unix:///run/containerd/containerd.sock); use unix:///run/k3s/containerd/containerd.sock for RKE2/k3s",
+				},
+				cli.StringFlag{
+					Name:  "containerd-config-path",
+					Usage: "containerd config file (empty: /etc/containerd/config.toml); use /var/lib/rancher/rke2/agent/etc/containerd/config.toml for RKE2",
+				},
+				cli.StringFlag{
+					Name:  "containerd-service-name",
+					Usage: "comma-separated containerd systemd units, active when any is active (empty: containerd); use rke2-agent,rke2-server for RKE2, k3s-agent,k3s for k3s",
+				},
+				cli.StringFlag{
+					Name:  "containerd-systemctl-commands",
+					Usage: "systemctl command prefix for both containerd activeness and uptime (e.g. 'nsenter --target 1 --mount -- systemctl'); empty runs systemctl directly; containerd-service-active-commands takes precedence for activeness",
+				},
 				cli.StringFlag{
 					Name:  "version-file",
 					Usage: "specifies the version file to use for auto update (leave empty to disable auto update)",
@@ -278,9 +312,18 @@ sudo rm /etc/systemd/system/gpud.service
 					Usage: "sets the plugin specs file (leave empty for default) -- if the file does not exist, gpud does not install/run any plugin, and updated configuration requires an gpud restart)",
 					Value: pkgcustomplugins.DefaultPluginSpecsFile,
 				},
+				cli.BoolFlag{
+					Name:  "plugin-specs-file-managed",
+					Usage: "quarantine invalid control-plane plugin profiles and continue startup so a corrected profile can be received",
+				},
 				cli.StringFlag{
 					Name:  "components",
 					Usage: "sets the components to enable (comma-separated, leave empty for default to enable all components, set 'none' or any other non-matching value to disable all components, prefix component name with '-' to disable it)",
+					Value: "",
+				},
+				&cli.StringFlag{
+					Name:  "nvsentinel-endpoint",
+					Usage: "unix socket path for the NVSentinel health event receiver (e.g. /var/run/nvsentinel/gpud.sock); setting this opens the socket and enables the integration",
 					Value: "",
 				},
 				&cli.BoolFlag{
@@ -330,7 +373,7 @@ sudo rm /etc/systemd/system/gpud.service
 				},
 				&cli.StringFlag{
 					Name:  "xid-thresholds",
-					Usage: `set per-XID thresholds in JSON, e.g. '{"overrides":{"94":{"rebootThreshold":1000}}}'`,
+					Usage: `set per-XID thresholds in JSON, e.g. '{"overrides":{"95":{"rebootThreshold":3}}}'`,
 				},
 				&cli.StringFlag{
 					Name:  "sxid-thresholds",

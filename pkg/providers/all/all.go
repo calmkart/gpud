@@ -19,26 +19,42 @@ import (
 
 var imdsRetryBackoffs = []time.Duration{0, 100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond}
 
+var ociDetector = pkgprovidersoci.New()
+
 var All = []pkgproviders.Detector{
 	pkgprovidersnscale.New(),
 	pkgprovidersnebius.New(),
 	pkgprovidersaws.New(),
 	pkgprovidersazure.New(),
 	pkgprovidersgcp.New(),
-	pkgprovidersoci.New(),
+	ociDetector,
 }
 
 // Detect detects the provider and returns the provider info.
 func Detect(ctx context.Context) (*pkgproviders.Info, error) {
-	return DetectWithRegionOverride(ctx, "")
+	return DetectWithOverrides(ctx, "", "")
 }
 
-// DetectWithRegionOverride skips provider-region metadata when regionOverride is set.
-func DetectWithRegionOverride(ctx context.Context, regionOverride string) (*pkgproviders.Info, error) {
+// DetectWithOverrides uses nonempty overrides for the returned region and instance
+// ID, skipping their discovery during identity collection. The instance ID override
+// is preserved exactly; provider detection and other metadata collection still run.
+func DetectWithOverrides(ctx context.Context, regionOverride, instanceIDOverride string) (*pkgproviders.Info, error) {
 	var detector pkgproviders.Detector
 	for _, d := range All {
 		cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		provider, err := d.Provider(cctx)
+		var provider string
+		var err error
+		// OCI normally probes its instance ID to identify the provider. With an
+		// explicit ID, identify the registry detector through region metadata instead.
+		if instanceIDOverride != "" && d == ociDetector {
+			var region string
+			region, err = d.(pkgproviders.RegionDetector).Region(cctx)
+			if region != "" && err == nil {
+				provider = d.Name()
+			}
+		} else {
+			provider, err = d.Provider(cctx)
+		}
 		cancel()
 		if err != nil {
 			if d != nil {
@@ -58,42 +74,57 @@ func DetectWithRegionOverride(ctx context.Context, regionOverride string) (*pkgp
 
 	if detector == nil {
 		return &pkgproviders.Info{
-			Provider: "unknown",
-			Region:   strings.TrimSpace(regionOverride),
+			Provider:   "unknown",
+			Region:     strings.TrimSpace(regionOverride),
+			InstanceID: instanceIDOverride,
 		}, nil
 	}
 
 	info := &pkgproviders.Info{
 		Provider:     detector.Name(),
 		IMDSDetected: pkgproviders.SupportsIMDS(detector),
+		InstanceID:   instanceIDOverride,
 	}
 
-	// Metadata fields are best-effort: provider detection has already succeeded,
-	// so one failed optional fetch should not discard provider identity.
-	publicIP, err := detector.PublicIPv4(ctx)
-	if err != nil {
-		log.Logger.Warnw("failed to get public IP", "provider", detector.Name(), "error", err)
-	} else {
-		info.PublicIP = publicIP
-	}
-
-	privateIP, err := detector.PrivateIPv4(ctx)
-	if err != nil {
-		log.Logger.Warnw("failed to get private IP", "provider", detector.Name(), "error", err)
-	} else {
-		info.PrivateIP = privateIP
-		log.Logger.Infow("successfully detected private IP", "provider", detector.Name(), "privateIP", privateIP)
+	// Fetch the required identity fields first: when the metadata service is
+	// slow or hanging, the optional best-effort fetches (public IP, VM
+	// environment, private IP) must not consume the shared context budget
+	// that the login-gating instance ID and region need.
+	if instanceIDOverride == "" {
+		instanceID, err := fetchProviderMetadata(ctx, detector, "instance ID", detector.InstanceID, false)
+		if err != nil {
+			log.Logger.Warnw("failed to get instance ID", "provider", detector.Name(), "error", err)
+		} else {
+			info.InstanceID = instanceID
+			log.Logger.Infow("successfully detected instance ID", "provider", detector.Name(), "instanceID", instanceID)
+		}
 	}
 
 	if regionOverride = strings.TrimSpace(regionOverride); regionOverride != "" {
 		info.Region = regionOverride
 	} else if regionDetector, ok := detector.(pkgproviders.RegionDetector); ok {
-		region, err := fetchRequiredMetadata(ctx, detector, "region", regionDetector.Region)
+		var region string
+		var err error
+		if detector.Name() == pkgprovidersnscale.Name {
+			region, err = regionDetector.Region(ctx)
+		} else {
+			region, err = fetchProviderMetadata(ctx, detector, "region", regionDetector.Region, false)
+		}
 		if err != nil {
 			log.Logger.Warnw("failed to get region", "provider", detector.Name(), "error", err)
 		} else {
-			info.Region = region
+			info.Region = strings.TrimSpace(region)
 		}
+	}
+
+	// Metadata fields below are best-effort: provider detection has already
+	// succeeded, so one failed optional fetch should not discard provider
+	// identity.
+	publicIP, err := fetchProviderMetadata(ctx, detector, "public IP", detector.PublicIPv4, true)
+	if err != nil {
+		log.Logger.Warnw("failed to get public IP", "provider", detector.Name(), "error", err)
+	} else {
+		info.PublicIP = publicIP
 	}
 
 	vmEnvironment, err := detector.VMEnvironment(ctx)
@@ -103,18 +134,36 @@ func DetectWithRegionOverride(ctx context.Context, regionOverride string) (*pkgp
 		info.VMEnvironment = vmEnvironment
 	}
 
-	instanceID, err := fetchRequiredMetadata(ctx, detector, "instance ID", detector.InstanceID)
+	// Private IP comes last: it is optional, and detectors that opted into
+	// retries (WithPrivateIPv4Retry) may spend a large share of the shared
+	// budget on it, so it must not run ahead of the required identity fields.
+	privateIP, err := fetchPrivateIPv4(ctx, detector)
 	if err != nil {
-		log.Logger.Warnw("failed to get instance ID", "provider", detector.Name(), "error", err)
+		log.Logger.Warnw("failed to get private IP", "provider", detector.Name(), "error", err)
 	} else {
-		info.InstanceID = instanceID
-		log.Logger.Infow("successfully detected instance ID", "provider", detector.Name(), "instanceID", instanceID)
+		info.PrivateIP = privateIP
+		log.Logger.Infow("successfully detected private IP", "provider", detector.Name(), "privateIP", privateIP)
 	}
 
+	// Type discovery must not consume the budget for required identity fields.
+	info.InstanceType = fetchInstanceType(ctx, detector)
 	return info, nil
 }
 
-func fetchRequiredMetadata(ctx context.Context, detector pkgproviders.Detector, field string, fetch func(context.Context) (string, error)) (string, error) {
+// fetchPrivateIPv4 reads the machine's private IPv4 from the detector.
+// Only detectors that explicitly opted in (providers.WithPrivateIPv4Retry —
+// currently nscale, whose metadata service can be slow to accept the first
+// connection after an idle period) use the same retry-with-backoff path as
+// region and instance ID; all other detectors keep a single attempt.
+func fetchPrivateIPv4(ctx context.Context, detector pkgproviders.Detector) (string, error) {
+	if !pkgproviders.SupportsPrivateIPv4Retry(detector) {
+		return detector.PrivateIPv4(ctx)
+	}
+	return fetchProviderMetadata(ctx, detector, "private IP", detector.PrivateIPv4, false)
+}
+
+// A successful empty public-IP read is terminal, unlike a missing required field.
+func fetchProviderMetadata(ctx context.Context, detector pkgproviders.Detector, field string, fetch func(context.Context) (string, error), allowEmpty bool) (string, error) {
 	if !pkgproviders.SupportsIMDS(detector) {
 		return fetch(ctx)
 	}
@@ -131,14 +180,14 @@ func fetchRequiredMetadata(ctx context.Context, detector pkgproviders.Detector, 
 
 		value, err := fetch(ctx)
 		value = strings.TrimSpace(value)
-		if err == nil && value != "" && !strings.EqualFold(value, "unknown") {
+		if err == nil && (allowEmpty || value != "" && !strings.EqualFold(value, "unknown")) {
 			return value, nil
 		}
 		if err == nil {
 			err = fmt.Errorf("empty or invalid %s", field)
 		}
 		lastErr = err
-		log.Logger.Warnw("failed to get required provider metadata",
+		log.Logger.Warnw("failed to get provider metadata",
 			"provider", detector.Name(),
 			"field", field,
 			"attempt", attempt+1,

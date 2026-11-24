@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
 	"runtime"
 	"sync"
 	"testing"
@@ -363,28 +362,6 @@ func TestNew(t *testing.T) {
 	assert.Equal(t, Name, comp.Name())
 }
 
-func hasKmsgEventDedupWindowFunc(t *testing.T, opt kmsg.OpOption) bool {
-	t.Helper()
-	op := &kmsg.Op{}
-	opt(op)
-
-	v := reflect.ValueOf(op).Elem().FieldByName("eventDedupWindowFunc")
-	require.True(t, v.IsValid(), "eventDedupWindowFunc field must exist")
-	require.Equal(t, reflect.Func, v.Kind(), "eventDedupWindowFunc must be func")
-	return !v.IsNil()
-}
-
-func getKmsgCacheKeyTruncateSeconds(t *testing.T, opt kmsg.OpOption) int {
-	t.Helper()
-	op := &kmsg.Op{}
-	opt(op)
-
-	v := reflect.ValueOf(op).Elem().FieldByName("cacheKeyTruncateSeconds")
-	require.True(t, v.IsValid(), "cacheKeyTruncateSeconds field must exist")
-	require.Equal(t, reflect.Int, v.Kind(), "cacheKeyTruncateSeconds must be int")
-	return int(v.Int())
-}
-
 // mockEventStore for testing New errors
 type mockEventStore struct {
 	bucketErr error
@@ -588,6 +565,11 @@ func (m *mockNVMLInstance) FabricManagerSupported() bool {
 
 func (m *mockNVMLInstance) FabricStateSupported() bool {
 	return false
+}
+
+func (m *mockNVMLInstance) Capabilities() nvidiaproduct.Capabilities {
+	// This fixture does not model capability-gated behavior.
+	return nvidiaproduct.Capabilities{}
 }
 
 func (m *mockNVMLInstance) GetMemoryErrorManagementCapabilities() nvidiaproduct.MemoryErrorManagementCapabilities {

@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"time"
 
+	apiv1 "github.com/leptonai/gpud/api/v1"
 	cmdcommon "github.com/leptonai/gpud/cmd/common"
 	"github.com/leptonai/gpud/pkg/config"
+	configcommon "github.com/leptonai/gpud/pkg/config/common"
 	"github.com/leptonai/gpud/pkg/log"
 	pkgmachineinfo "github.com/leptonai/gpud/pkg/machine-info"
 	pkgmetadata "github.com/leptonai/gpud/pkg/metadata"
@@ -68,8 +70,12 @@ type LoginConfig struct {
 	PublicIP  string // optional: overrides detected public IP
 	PrivateIP string // optional: overrides detected private IP
 
+	// InstanceID overrides the provider instance ID only for login and skips its discovery.
+	InstanceID string
+
 	// Region overrides the login region and skips provider-region IMDS and DERP lookup.
-	Region string
+	Region     string
+	Containerd configcommon.ContainerdConfig
 }
 
 // Login performs the login operation with the control plane.
@@ -294,12 +300,28 @@ func Login(ctx context.Context, cfg LoginConfig) error {
 	// otherwise, the control plane will assign a new machine ID
 	loginCreatedAt := time.Now()
 	log.Logger.Debugw("creating login request")
-	req, err := pkgmachineinfo.CreateLoginRequestWithRegion(cfg.Token, cfg.MachineID, cfg.NodeGroup, cfg.GPUCount, cfg.Region, nvmlInstance)
+	createRequest := pkgmachineinfo.CreateLoginRequestWithOverrides
+	if !cfg.Containerd.IsZero() {
+		createRequest = func(token, machineID, nodeGroup, gpuCount, region, instanceID string, instance nvidianvml.Instance) (*apiv1.LoginRequest, error) {
+			return pkgmachineinfo.CreateLoginRequestWithContainerd(token, machineID, nodeGroup, gpuCount, region, instanceID, instance, cfg.Containerd)
+		}
+	}
+	req, err := createRequest(cfg.Token, cfg.MachineID, cfg.NodeGroup, cfg.GPUCount, cfg.Region, cfg.InstanceID, nvmlInstance)
 	if err != nil {
 		return fmt.Errorf("failed to create login request: %w", err)
 	}
 	req.NodeLabels = cfg.NodeLabels
 	log.Logger.Debugw("successfully created login request", "duration", time.Since(loginCreatedAt))
+
+	machineProof := ""
+	if reloginExistingMachine {
+		// The control plane can require the proof from this machine's previous
+		// login before it issues a new one.
+		machineProof, err = pkgmetadata.ReadMetadata(ctx, dbRO, pkgmetadata.MetadataKeyMachineProof)
+		if err != nil {
+			return fmt.Errorf("failed to read machine proof: %w", err)
+		}
+	}
 
 	if cfg.PublicIP != "" { // overwrite if not empty
 		req.Network.PublicIP = cfg.PublicIP
@@ -313,7 +335,7 @@ func Login(ctx context.Context, cfg LoginConfig) error {
 	// thus request one and blocks until the login request is processed
 	loginSentAt := time.Now()
 	log.Logger.Debugw("sending login request")
-	loginResp, err := SendRequest(ctx, cfg.Endpoint, *req)
+	loginResp, err := SendRequest(ctx, cfg.Endpoint, *req, machineProof)
 	if err != nil {
 		log.Logger.Debugw("failed to login", "error", err)
 		if loginResp != nil {
@@ -330,6 +352,11 @@ func Login(ctx context.Context, cfg LoginConfig) error {
 			if statusCode == "" {
 				// nolint:staticcheck // SA1019 This field is used for compatibility with older versions.
 				statusCode = loginResp.Status
+			}
+			if statusCode == "" && errorMessage == "" {
+				// Gateways may return JSON with no login error fields. Preserve the
+				// safe HTTP-status error instead of emitting an empty reason.
+				return fmt.Errorf("failed to login: %w", err)
 			}
 			return fmt.Errorf("failed to login (reason: %s%s)", statusCode, es)
 		}

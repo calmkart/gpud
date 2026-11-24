@@ -266,4 +266,10 @@ var providerNormalizationRules = []providerNormalizationRule{
 	{keyword: "nebius", normalizedName: "nebius"},   // e.g., "nebiuscloud" should be "nebius"
 	{keyword: "hetzner", normalizedName: "hetzner"}, // e.g., "hetzner-cloud3-as" should be "hetzner"
 	{keyword: "oracle", normalizedName: "oci"},      // e.g., "oracle-bmc-31898" should be "oci"
+	// e.g., "Mistral-Compute - Mistral Compute Holding SAS" (AS209952) should be "mistral"
+	{keyword: "mistral-compute", normalizedName: "mistral"},
+	// "LAMBDA - Lambda, US" (AS398090) is sanitized to "lambda - lambda" by the
+	// Team Cymru lookup and to "lambda" by HackerTarget. A bare "lambda"
+	// keyword would also match unrelated networks such as "LAMBDANET-AS".
+	{keyword: "lambda - lambda", normalizedName: "lambda"},
 }

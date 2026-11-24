@@ -19,6 +19,8 @@ import (
 
 	apiv1 "github.com/leptonai/gpud/api/v1"
 	"github.com/leptonai/gpud/components"
+	"github.com/leptonai/gpud/components/accelerator/nvidia/fabric"
+	fabricmanager "github.com/leptonai/gpud/components/accelerator/nvidia/fabric-manager"
 	"github.com/leptonai/gpud/pkg/eventstore"
 	pkghost "github.com/leptonai/gpud/pkg/host"
 	"github.com/leptonai/gpud/pkg/kmsg"
@@ -26,6 +28,7 @@ import (
 	nvmlerrors "github.com/leptonai/gpud/pkg/nvidia/errors"
 	nvidianvml "github.com/leptonai/gpud/pkg/nvidia/nvml"
 	"github.com/leptonai/gpud/pkg/nvidia/nvml/device"
+	nvidiaproduct "github.com/leptonai/gpud/pkg/nvidia/product"
 )
 
 // Name is the name of the NVIDIA NVLink component.
@@ -41,6 +44,8 @@ const (
 var _ components.Component = &component{}
 
 type component struct {
+	checkMu sync.Mutex
+
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -51,9 +56,11 @@ type component struct {
 	getNVLinkFunc            func(uuid string, dev device.Device) (NVLink, error)
 	getPeerNVLinkP2PStatusFn func(dev device.Device, peer device.Device) (string, error)
 	getThresholdsFunc        func() ExpectedLinkStates
+	checkNVSwitchExistsFunc  func() bool
 	eventBucket              eventstore.Bucket
 	kmsgSyncer               *kmsg.Syncer
 	readAllKmsg              func(context.Context) ([]kmsg.Message, error)
+	fabricRegistration       fabric.Registration
 
 	lastMu               sync.RWMutex
 	lastCheckResult      *checkResult
@@ -72,13 +79,25 @@ func New(gpudInstance *components.GPUdInstance) (components.Component, error) {
 		ctx:    cctx,
 		cancel: ccancel,
 		getTimeNowFunc: func() time.Time {
-			return time.Now().UTC()
+			return time.Now()
 		},
-		getBootTimeFunc:          pkghost.BootTime,
-		nvmlInstance:             gpudInstance.NVMLInstance,
-		getNVLinkFunc:            GetNVLink,
+		getBootTimeFunc: pkghost.BootTime,
+		nvmlInstance:    gpudInstance.NVMLInstance,
+		getNVLinkFunc: func(uuid string, dev device.Device) (NVLink, error) {
+			if gpudInstance.NVMLInstance.Capabilities().Rubin {
+				return getRubinNVLink(uuid, dev)
+			}
+			return GetNVLink(uuid, dev)
+		},
 		getPeerNVLinkP2PStatusFn: getPeerNVLinkP2PStatus,
 		getThresholdsFunc:        GetDefaultExpectedLinkStates,
+		checkNVSwitchExistsFunc: func() bool {
+			ctx, cancel := context.WithTimeout(cctx, 5*time.Second)
+			defer cancel()
+			switches, err := fabricmanager.ListPCINVSwitches(ctx)
+			// Failed detection cannot prove the absence of a switch.
+			return err != nil || len(switches) > 0
+		},
 	}
 
 	if gpudInstance.EventStore != nil {
@@ -114,6 +133,10 @@ func New(gpudInstance *components.GPUdInstance) (components.Component, error) {
 	}
 	if gpudInstance.EventStore == nil && runtime.GOOS == "linux" && os.Geteuid() == 0 {
 		c.readAllKmsg = kmsg.ReadAll
+	}
+	if err := c.fabricRegistration.Open(c.ctx, gpudInstance.DBRW, Name, pkghost.BootID()); err != nil {
+		_ = c.Close()
+		return nil, err
 	}
 	return c, nil
 }
@@ -224,6 +247,10 @@ func (c *component) Close() error {
 }
 
 func (c *component) Check() components.CheckResult {
+	// Keep collection timestamps, registration deadlines, and result publication ordered.
+	c.checkMu.Lock()
+	defer c.checkMu.Unlock()
+
 	log.Logger.Infow("checking nvidia gpu nvlink")
 
 	startedAt := c.getTimeNowFunc()
@@ -308,6 +335,24 @@ func (c *component) Check() components.CheckResult {
 	}
 
 	devs := c.nvmlInstance.Devices()
+	caps := c.nvmlInstance.Capabilities()
+	// Physical architecture is diagnostic metadata; capabilities honor overrides.
+	isRubin := caps.Rubin
+	var fabricReport *fabric.Report
+	// Rubin may expose a single GPU from a rack even without C2C telemetry.
+	// Probe registration before deciding whether a fabric is present.
+	if (len(devs) > 1 || isRubin) && c.nvmlInstance.FabricStateSupported() {
+		report := fabric.Collect(devs)
+		switchDetected := false
+		if report.AllUnsupported && c.checkNVSwitchExistsFunc != nil {
+			switchDetected = c.checkNVSwitchExistsFunc()
+		}
+
+		if !report.UnsupportedWithoutFabric(caps.ExplicitNVL72, switchDetected) {
+			fabricReport = &report
+		}
+		cr.FabricStates = report.Entries
+	}
 	// Only expect NVLink by default on multi-GPU hosts that advertise NVIDIA
 	// fabric support. This keeps 1-GPU machines safe: for a single GPU,
 	// `nvidia-smi topo -p2p n` legitimately shows only the self entry:
@@ -328,6 +373,13 @@ func (c *component) Check() components.CheckResult {
 	// and some are not, operators must still configure ExpectedLinkStates to make
 	// partial degradation fail health checks.
 	cr.SystemExpectedNVLink = len(devs) > 1 && (c.nvmlInstance.FabricManagerSupported() || c.nvmlInstance.FabricStateSupported())
+	if isRubin {
+		// Rubin's family-wide FabricState capability permits a query; it does
+		// not prove NVLink connectivity on PCIe-only development systems. The
+		// report is retained when telemetry or topology establishes a fabric,
+		// and discarded only for unsupported telemetry with no fabric evidence.
+		cr.SystemExpectedNVLink = len(devs) > 1 && fabricReport != nil
+	}
 	sortedUUIDs := make([]string, 0, len(devs))
 	for uuid := range devs {
 		sortedUUIDs = append(sortedUUIDs, uuid)
@@ -383,9 +435,21 @@ func (c *component) Check() components.CheckResult {
 		dev := devs[uuid]
 		nvLink, err := c.getNVLinkFunc(uuid, dev)
 		if err != nil {
+			// A counter can fail after link states have been read, and fabric
+			// collection can already have found a separate error. Keep both the
+			// partial link evidence and every error in the public health response.
+			if len(nvLink.States) > 0 {
+				cr.NVLinks = append(cr.NVLinks, nvLink)
+			}
 			cr.err = err
+			if fabricReport != nil {
+				cr.err = errors.Join(cr.err, fabricReport.Err)
+			}
 			cr.health = apiv1.HealthStateTypeUnhealthy
 			cr.reason = "error getting nvlink"
+			if fabricReport != nil || caps.ExternalFabricCandidate || isRubin {
+				cr.suggestedActions = fabric.SuggestedActions(cr.err, cr.health)
+			}
 
 			if errors.Is(err, nvmlerrors.ErrGPURequiresReset) {
 				cr.reason = nvmlerrors.ErrGPURequiresReset.Error()
@@ -451,8 +515,51 @@ func (c *component) Check() components.CheckResult {
 
 	cr.health = apiv1.HealthStateTypeHealthy
 	cr.reason = fmt.Sprintf("all %d GPU(s) were checked, no nvlink issue found", len(devs))
+	if fabricReport != nil {
+		health, reason, err := c.fabricRegistration.Evaluate(c.ctx, cr.ts, fabricReport.Pending, fabricReport.Failed)
+		if health != apiv1.HealthStateTypeHealthy {
+			cr.health = health
+			cr.reason = appendNVLinkFailureDetails(reason+": "+fabricReport.Reason, cr)
+			cr.err = errors.Join(fabricReport.Err, err)
+			// Inactive links and failed P2P can be consequences of unavailable fabric.
+			// Only independent device-loss/reset evidence justifies host recovery.
+			cr.suggestedActions = fabric.SuggestedActions(cr.err, health)
+			return cr
+		}
+	}
 
 	evaluateHealthStateWithThresholds(cr)
+	// Rubin rack trays get a default per-link check. NVIDIA's DGX Vera Rubin
+	// NVL72 post-reboot verification requires "all the links are active" once
+	// fabric state reports Completed/Success:
+	// https://docs.nvidia.com/dgx/dgxvr-user-guide/rack-reboot-sequence.html
+	//
+	// Require confirmed registration first (fabricReport non-nil and Healthy:
+	// every visible GPU Completed+Success with no health issues). Links are
+	// legitimately down before the fabric is configured and while registration
+	// is pending; the registration guard above already reports those states.
+	//
+	// GB200/GB300 deliberately keep the implicit "zero active GPUs" fallback:
+	// that is existing fleet behavior and they are not part of Rubin
+	// qualification, so tightening it would change health on deployed racks.
+	// An unwired index is not yet qualified as a fault on every Rubin tray.
+	// Keep its raw state visible and require an operator opt-in to this rule.
+	if isRubin && nvidiaproduct.RubinHealthRulesEnabled() &&
+		caps.ExternalFabricCandidate && fabricReport != nil && fabricReport.Healthy {
+		evaluateRubinRackInactiveLinks(cr)
+	}
+	// Unknown Rubin host attachment can still be an NVL72 rack when C2C queries
+	// are unavailable. Failed links establish an outage, not that the failed
+	// hardware belongs to this host. Earlier GPU families retain
+	// the legacy link-based reboot advice; device loss/reset above still wins.
+	externalOrUnknownFabric := caps.ExternalFabricCandidate ||
+		isRubin
+	if cr.health == apiv1.HealthStateTypeUnhealthy && externalOrUnknownFabric {
+		// A fabric candidate does not establish that failed links are host-local:
+		// on an NVL72 tray a dead link may be on the switch tray or cable
+		// cartridge side, which rebooting the compute tray cannot repair.
+		cr.suggestedActions = fabric.SuggestedActions(nil, cr.health)
+	}
 
 	return cr
 }
@@ -464,7 +571,8 @@ type checkResult struct {
 	MatchedKmsgs []kmsg.Message `json:"-"`
 
 	// NVLinks contains detailed NVLink information for all GPUs checked
-	NVLinks []NVLink `json:"nvlinks,omitempty"`
+	NVLinks      []NVLink                  `json:"nvlinks,omitempty"`
+	FabricStates []device.FabricStateEntry `json:"fabric_states,omitempty"`
 
 	// ActiveNVLinkUUIDs lists GPUs where NVLink is supported AND all links have FeatureEnabled=true
 	// (i.e., len(States) > 0 && States.AllFeatureEnabled() == true)

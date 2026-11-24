@@ -296,6 +296,45 @@ type MachineInfo struct {
 	DiskInfo *MachineDiskInfo `json:"diskInfo,omitempty"`
 	// NICInfo is the network info of the machine.
 	NICInfo *MachineNICInfo `json:"nicInfo,omitempty"`
+
+	// Firmware lists the firmware and host software versions read on the node,
+	// one entry per (component, version), sorted by component and then version.
+	// GPUd refreshes it at startup and every 4 hours.
+	// Omitted when nothing was collected; consumers must treat absence as unknown.
+	Firmware []MachineFirmware `json:"firmware,omitempty"`
+}
+
+// Firmware component names reported in MachineFirmware.Component.
+const (
+	// FirmwareComponentGPU is the GPU VBIOS version read through NVML.
+	FirmwareComponentGPU = "GPU"
+	// FirmwareComponentCX8 is the firmware of a ConnectX-8 NIC (PCI device 0x1023).
+	FirmwareComponentCX8 = "cx8"
+	// FirmwareComponentCX8AWS is the firmware of a ConnectX-8 NIC whose PSID starts with "AS".
+	FirmwareComponentCX8AWS = "cx8-aws"
+	// FirmwareComponentBF3NIC is the firmware of a BlueField-3 NIC (PCI device 0xa2dc).
+	FirmwareComponentBF3NIC = "bf3_nic"
+	// FirmwareComponentHMCSBIOS is the system BIOS version of an NVIDIA Grace bare-metal host.
+	FirmwareComponentHMCSBIOS = "hmc-sbios"
+	// FirmwareComponentDOCAHost is the version of the installed DOCA host package.
+	FirmwareComponentDOCAHost = "doca_host"
+)
+
+// MachineFirmware is one version of one firmware component. Instances of the
+// same component that run the same version share one entry.
+type MachineFirmware struct {
+	// Component is one of "GPU", "cx8", "cx8-aws", "bf3_nic", "hmc-sbios" or "doca_host".
+	Component string `json:"component"`
+	// Version is the version string as read on the node, without normalization.
+	Version string `json:"version"`
+	// Instances is the number of instances that run this version.
+	Instances int32 `json:"instances"`
+	// InstanceNames names the instances in natural order: "gpu1".."gpuN" by PCI bus ID
+	// for GPUs, and the InfiniBand device name of each card for NICs.
+	// Omitted for host-level components ("hmc-sbios", "doca_host").
+	InstanceNames []string `json:"instanceNames,omitempty"`
+	// LastUpdated is the UTC time, in whole seconds, of the read that produced this entry.
+	LastUpdated metav1.Time `json:"lastUpdated"`
 }
 
 func (i *MachineInfo) RenderTable(wr io.Writer) {
@@ -311,6 +350,15 @@ func (i *MachineInfo) RenderTable(wr io.Writer) {
 		table.Append([]string{"CPU Manufacturer", i.CPUInfo.Manufacturer})
 		table.Append([]string{"CPU Architecture", i.CPUInfo.Architecture})
 		table.Append([]string{"CPU Logical Cores", fmt.Sprintf("%d", i.CPUInfo.LogicalCores)})
+		if i.CPUInfo.CPUsPerCore > 0 {
+			table.Append([]string{"CPU Threads Per Core", fmt.Sprintf("%d", i.CPUInfo.CPUsPerCore)})
+		}
+		if i.CPUInfo.NumCores > 0 {
+			table.Append([]string{"CPU Physical Cores", fmt.Sprintf("%d", i.CPUInfo.NumCores)})
+		}
+		if i.CPUInfo.NumSockets > 0 {
+			table.Append([]string{"CPU Sockets", fmt.Sprintf("%d", i.CPUInfo.NumSockets)})
+		}
 	}
 	if i.MemoryInfo != nil {
 		table.Append([]string{"Memory Total", humanize.IBytes(i.MemoryInfo.TotalBytes)})
@@ -331,6 +379,9 @@ func (i *MachineInfo) RenderTable(wr io.Writer) {
 		}
 		if i.GPUInfo.CliqueID != nil {
 			table.Append([]string{"GPU Fabric Clique ID", fmt.Sprintf("%d", *i.GPUInfo.CliqueID)})
+		}
+		for _, clique := range i.GPUInfo.Cliques {
+			table.Append([]string{"GPU Fabric " + clique.TypeName(), fmt.Sprintf("%d", clique.ID)})
 		}
 		if i.GPUInfo.ChassisSerial != "" {
 			table.Append([]string{"Chassis Serial", i.GPUInfo.ChassisSerial})
@@ -359,6 +410,31 @@ func (i *MachineInfo) RenderTable(wr io.Writer) {
 		i.GPUInfo.RenderTable(wr)
 		_, _ = fmt.Fprintf(wr, "\n")
 	}
+
+	if len(i.Firmware) > 0 {
+		renderFirmwareTable(wr, i.Firmware)
+		_, _ = fmt.Fprintf(wr, "\n")
+	}
+}
+
+func renderFirmwareTable(wr io.Writer, rows []MachineFirmware) {
+	table := tablewriter.NewWriter(wr)
+	table.SetAlignment(tablewriter.ALIGN_CENTER)
+	table.SetHeader([]string{"Component", "Version", "Instances", "Instance names", "Last updated (UTC)"})
+	for _, fw := range rows {
+		lastUpdated := ""
+		if !fw.LastUpdated.IsZero() {
+			lastUpdated = fw.LastUpdated.UTC().Format(time.RFC3339)
+		}
+		table.Append([]string{
+			fw.Component,
+			fw.Version,
+			strconv.Itoa(int(fw.Instances)),
+			strings.Join(fw.InstanceNames, ", "),
+			lastUpdated,
+		})
+	}
+	table.Render()
 }
 
 type MachineCPUInfo struct {
@@ -366,6 +442,16 @@ type MachineCPUInfo struct {
 	Manufacturer string `json:"manufacturer,omitempty"`
 	Architecture string `json:"architecture,omitempty"`
 	LogicalCores int64  `json:"logicalCores,omitempty"`
+
+	// CPUsPerCore is the uniform number of online hardware threads per core.
+	// Omitted when topology is unavailable or online thread counts are nonuniform.
+	CPUsPerCore int64 `json:"cpusPerCore,omitempty"`
+	// NumCores is the total physical cores represented by online CPUs across all sockets.
+	// Omitted when topology is unavailable.
+	NumCores int64 `json:"numCores,omitempty"`
+	// NumSockets is the number of physical sockets represented by online CPUs.
+	// Omitted when topology or CPU package IDs are unavailable.
+	NumSockets int64 `json:"numSockets,omitempty"`
 }
 
 type MachineMemoryInfo struct {
@@ -373,7 +459,8 @@ type MachineMemoryInfo struct {
 }
 
 type MachineGPUInfo struct {
-	// Product may be "NVIDIA-Graphics-Device" for NVIDIA GB200.
+	// Product is the driver name with whitespace normalized to hyphens.
+	// Development Blackwell and Rubin drivers may report "NVIDIA-Graphics-Device".
 	Product string `json:"product,omitempty"`
 
 	// Manufacturer is "NVIDIA" for NVIDIA GPUs (same as Brand).
@@ -390,10 +477,13 @@ type MachineGPUInfo struct {
 	// Collected with the NVML fabric state API. Empty when the node is not in
 	// an NVLink fabric.
 	ClusterUUID string `json:"clusterUUID,omitempty"`
-	// CliqueID is the GPU fabric clique ID ("Clique Id" in nvidia-smi -q).
-	// It identifies the clique of the node inside the NVLink fabric. A pointer
-	// preserves clique 0 as a reported value while nil means not reported.
+	// CliqueID retains the deprecated single-clique wire field for compatibility.
+	// With fabric-info V4 it is the first Unicast Pointer clique, never a logical
+	// endpoint clique. Nil means unavailable; a pointer preserves a valid zero.
 	CliqueID *uint32 `json:"cliqueID,omitempty"`
+	// Cliques contains the typed V4 assignments shared by every GPU on the node.
+	// Older APIs cannot supply this list; do not infer other types from CliqueID.
+	Cliques []GPUFabricClique `json:"cliques,omitempty"`
 	// ChassisSerial is the serial number of the chassis that contains the GPUs
 	// as reported by NVML platform info. Support and operations teams use it to
 	// find the physical hardware for repair or replacement.
@@ -402,6 +492,29 @@ type MachineGPUInfo struct {
 
 	// GPUs is the GPU info of the machine.
 	GPUs []MachineGPUInstance `json:"gpus,omitempty"`
+}
+
+// GPUFabricClique preserves NVML's (type, id) pair, including future types and
+// multiple assignments of one type. IDs from different types are not interchangeable.
+type GPUFabricClique struct {
+	Type uint8  `json:"type"`
+	ID   uint32 `json:"id"`
+}
+
+// TypeName returns the nvidia-smi label for a fabric clique type.
+func (c GPUFabricClique) TypeName() string {
+	switch c.Type {
+	case 0:
+		return "Unicast Pointer"
+	case 1:
+		return "Multicast Pointer"
+	case 2:
+		return "Unicast LE"
+	case 3:
+		return "Multicast LE"
+	default:
+		return fmt.Sprintf("Unknown Type %d", c.Type)
+	}
 }
 
 type MachineGPUInstance struct {
@@ -491,7 +604,9 @@ type MachineNetwork struct {
 	PublicIP string `json:"publicIP,omitempty"`
 	// PrivateIP is the local IPv4 used by the host networking stack.
 	// This is usually an RFC1918 private address, but some providers
-	// may report a routable host-local IPv4 via metadata.
+	// may report a routable host-local IPv4 via metadata, and hosts
+	// without metadata fall back to the default-route interface IPv4
+	// (the address kubelet uses as the node InternalIP).
 	// May be overridden by the user with the private IP address.
 	PrivateIP string `json:"privateIP,omitempty"`
 }

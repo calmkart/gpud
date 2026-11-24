@@ -58,6 +58,10 @@ func (m *mockNVMLInstance) DriverMajor() int                  { return 1 }
 func (m *mockNVMLInstance) CUDAVersion() string               { return "mock-cuda" }
 func (m *mockNVMLInstance) FabricManagerSupported() bool      { return false }
 func (m *mockNVMLInstance) FabricStateSupported() bool        { return false }
+func (m *mockNVMLInstance) Capabilities() nvidiaproduct.Capabilities {
+	// This fixture does not model capability-gated behavior.
+	return nvidiaproduct.Capabilities{}
+}
 func (m *mockNVMLInstance) GetMemoryErrorManagementCapabilities() nvidiaproduct.MemoryErrorManagementCapabilities {
 	return nvidiaproduct.MemoryErrorManagementCapabilities{}
 }
@@ -414,7 +418,7 @@ func TestNew_WithMockNVML(t *testing.T) {
 			Address:                "invalid-address",
 			DataDir:                tmpDir,
 			MetricsRetentionPeriod: metav1.Duration{Duration: time.Minute},
-			Components:             []string{"-disable-all"},
+			Components:             []string{"none"},
 		}
 
 		s, err := New(ctx, log.NewNopAuditLogger(), cfg, nil)
@@ -448,7 +452,7 @@ func TestNew_PluginSpecsFileNotFound(t *testing.T) {
 			Address:                "invalid-address",
 			DataDir:                tmpDir,
 			MetricsRetentionPeriod: metav1.Duration{Duration: time.Minute},
-			Components:             []string{"-disable-all"},
+			Components:             []string{"none"},
 			PluginSpecsFile:        filepath.Join(tmpDir, "nonexistent-plugins.yaml"),
 		}
 
@@ -1468,7 +1472,7 @@ func TestNew_DBInMemoryMode(t *testing.T) {
 			Address:                "localhost:0",
 			DataDir:                tmpDir,
 			MetricsRetentionPeriod: metav1.Duration{Duration: time.Minute},
-			Components:             []string{"-disable-all"},
+			Components:             []string{"none"},
 			DBInMemory:             true,
 		}
 
@@ -1500,7 +1504,7 @@ func TestNew_DBInMemoryWithSessionCredentials(t *testing.T) {
 			Address:                "localhost:0",
 			DataDir:                tmpDir,
 			MetricsRetentionPeriod: metav1.Duration{Duration: time.Minute},
-			Components:             []string{"-disable-all"},
+			Components:             []string{"none"},
 			DBInMemory:             true,
 			SessionToken:           "test-session-token",
 			SessionMachineID:       "test-machine-id",
@@ -1717,7 +1721,7 @@ func TestNew_MetadataReadError(t *testing.T) {
 			Address:                "localhost:0",
 			DataDir:                tmpDir,
 			MetricsRetentionPeriod: metav1.Duration{Duration: time.Minute},
-			Components:             []string{"-disable-all"},
+			Components:             []string{"none"},
 		}
 
 		s, err := New(ctx, log.NewNopAuditLogger(), cfg, nil)

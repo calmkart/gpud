@@ -3,6 +3,7 @@ package machineinfo
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
@@ -45,8 +46,91 @@ func newFabricMachineInfoDevice(fabricState nvidiadevice.FabricState, fabricErr 
 	}
 }
 
+func completedFabricState(clusterUUID string, cliqueID uint32) nvidiadevice.FabricState {
+	return nvidiadevice.FabricState{
+		CliqueID:    cliqueID,
+		ClusterUUID: clusterUUID,
+		State:       nvml.GPU_FABRIC_STATE_COMPLETED,
+		Status:      nvml.SUCCESS,
+	}
+}
+
+func newFabricMachineInfoInstance(states ...nvidiadevice.FabricState) *mockNvmlInstanceForMockey {
+	devices := make(map[string]nvidiadevice.Device, len(states))
+	for i, state := range states {
+		dev := newFabricMachineInfoDevice(state, nil)
+		dev.uuid = fmt.Sprintf("GPU-test-uuid-%d", i)
+		devices[dev.uuid] = dev
+	}
+	return &mockNvmlInstanceForMockey{devices: devices}
+}
+
 func TestGetGPUFabricIdentifiers(t *testing.T) {
-	t.Run("returns identifiers from the first readable device", func(t *testing.T) {
+	t.Run("returns identifiers when all devices agree", func(t *testing.T) {
+		nvmlInstance := newFabricMachineInfoInstance(
+			completedFabricState("cluster-uuid-123", 32766),
+			completedFabricState("cluster-uuid-123", 32766),
+			completedFabricState("cluster-uuid-123", 32766),
+			completedFabricState("cluster-uuid-123", 32766),
+		)
+
+		clusterUUID, cliqueID, _ := getGPUFabricIdentifiers(nvmlInstance)
+		assert.Equal(t, "cluster-uuid-123", clusterUUID)
+		assert.Equal(t, ptr.To(uint32(32766)), cliqueID)
+	})
+
+	t.Run("omits identifiers unless all devices agree on a completed registration", func(t *testing.T) {
+		tests := []struct {
+			name   string
+			states []nvidiadevice.FabricState
+		}{
+			{
+				// While a rack's NVLink partition is down, each GPU reports a clique of its own.
+				name: "different clique ids",
+				states: []nvidiadevice.FabricState{
+					completedFabricState("cluster-uuid-123", 101),
+					completedFabricState("cluster-uuid-123", 102),
+					completedFabricState("cluster-uuid-123", 103),
+					completedFabricState("cluster-uuid-123", 104),
+				},
+			},
+			{
+				name: "different cluster uuids",
+				states: []nvidiadevice.FabricState{
+					completedFabricState("cluster-uuid-123", 32766),
+					completedFabricState("cluster-uuid-456", 32766),
+				},
+			},
+			{
+				name: "registration in progress on one device",
+				states: []nvidiadevice.FabricState{
+					completedFabricState("cluster-uuid-123", 32766),
+					{CliqueID: 32766, ClusterUUID: "cluster-uuid-123", State: nvml.GPU_FABRIC_STATE_IN_PROGRESS, Status: nvml.SUCCESS},
+				},
+			},
+			{
+				name: "registration failed on one device",
+				states: []nvidiadevice.FabricState{
+					completedFabricState("cluster-uuid-123", 32766),
+					{CliqueID: 32766, ClusterUUID: "cluster-uuid-123", State: nvml.GPU_FABRIC_STATE_COMPLETED, Status: nvml.ERROR_UNKNOWN},
+				},
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				nvmlInstance := newFabricMachineInfoInstance(tt.states...)
+
+				// Devices are iterated in random map order; no order may produce a value.
+				for i := 0; i < 20; i++ {
+					clusterUUID, cliqueID, _ := getGPUFabricIdentifiers(nvmlInstance)
+					assert.Empty(t, clusterUUID)
+					assert.Nil(t, cliqueID)
+				}
+			})
+		}
+	})
+
+	t.Run("returns identifiers of a single fabric device", func(t *testing.T) {
 		dev := newFabricMachineInfoDevice(nvidiadevice.FabricState{
 			CliqueID:    42,
 			ClusterUUID: "cluster-uuid-123",
@@ -57,12 +141,12 @@ func TestGetGPUFabricIdentifiers(t *testing.T) {
 			devices: map[string]nvidiadevice.Device{dev.uuid: dev},
 		}
 
-		clusterUUID, cliqueID := getGPUFabricIdentifiers(nvmlInstance)
+		clusterUUID, cliqueID, _ := getGPUFabricIdentifiers(nvmlInstance)
 		assert.Equal(t, "cluster-uuid-123", clusterUUID)
 		assert.Equal(t, ptr.To(uint32(42)), cliqueID)
 	})
 
-	t.Run("skips devices with fabric state errors", func(t *testing.T) {
+	t.Run("omits identifiers if any device cannot be queried", func(t *testing.T) {
 		devErr := newFabricMachineInfoDevice(nvidiadevice.FabricState{}, errors.New("fabric state telemetry not supported"))
 		devOK := newFabricMachineInfoDevice(nvidiadevice.FabricState{
 			CliqueID:    7,
@@ -78,9 +162,9 @@ func TestGetGPUFabricIdentifiers(t *testing.T) {
 			},
 		}
 
-		clusterUUID, cliqueID := getGPUFabricIdentifiers(nvmlInstance)
-		assert.Equal(t, "cluster-uuid-456", clusterUUID)
-		assert.Equal(t, ptr.To(uint32(7)), cliqueID)
+		clusterUUID, cliqueID, _ := getGPUFabricIdentifiers(nvmlInstance)
+		assert.Empty(t, clusterUUID)
+		assert.Nil(t, cliqueID)
 	})
 
 	t.Run("returns empty values when no device supports fabric state", func(t *testing.T) {
@@ -89,9 +173,42 @@ func TestGetGPUFabricIdentifiers(t *testing.T) {
 			devices: map[string]nvidiadevice.Device{dev.uuid: dev},
 		}
 
-		clusterUUID, cliqueID := getGPUFabricIdentifiers(nvmlInstance)
+		clusterUUID, cliqueID, _ := getGPUFabricIdentifiers(nvmlInstance)
 		assert.Empty(t, clusterUUID)
 		assert.Nil(t, cliqueID)
+	})
+
+	t.Run("omits clique id when the fabric state has no cluster uuid", func(t *testing.T) {
+		// A non-fabric GPU can report SUCCESS with a zeroed fabric state instead
+		// of an error; the empty cluster UUID marks the node as non-fabric and the
+		// clique id must stay unreported (LEP-6676).
+		dev := newFabricMachineInfoDevice(nvidiadevice.FabricState{
+			CliqueID: 0,
+			Status:   nvml.SUCCESS,
+		}, nil)
+		nvmlInstance := &mockNvmlInstanceForMockey{
+			devices: map[string]nvidiadevice.Device{dev.uuid: dev},
+		}
+
+		clusterUUID, cliqueID, _ := getGPUFabricIdentifiers(nvmlInstance)
+		assert.Empty(t, clusterUUID)
+		assert.Nil(t, cliqueID)
+	})
+
+	t.Run("keeps an explicit clique zero on a fabric node", func(t *testing.T) {
+		dev := newFabricMachineInfoDevice(nvidiadevice.FabricState{
+			CliqueID:    0,
+			ClusterUUID: "cluster-uuid-789",
+			State:       nvml.GPU_FABRIC_STATE_COMPLETED,
+			Status:      nvml.SUCCESS,
+		}, nil)
+		nvmlInstance := &mockNvmlInstanceForMockey{
+			devices: map[string]nvidiadevice.Device{dev.uuid: dev},
+		}
+
+		clusterUUID, cliqueID, _ := getGPUFabricIdentifiers(nvmlInstance)
+		assert.Equal(t, "cluster-uuid-789", clusterUUID)
+		assert.Equal(t, ptr.To(uint32(0)), cliqueID)
 	})
 
 	t.Run("returns empty values without devices", func(t *testing.T) {
@@ -99,7 +216,7 @@ func TestGetGPUFabricIdentifiers(t *testing.T) {
 			devices: map[string]nvidiadevice.Device{},
 		}
 
-		clusterUUID, cliqueID := getGPUFabricIdentifiers(nvmlInstance)
+		clusterUUID, cliqueID, _ := getGPUFabricIdentifiers(nvmlInstance)
 		assert.Empty(t, clusterUUID)
 		assert.Nil(t, cliqueID)
 	})

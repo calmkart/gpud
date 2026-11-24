@@ -896,6 +896,17 @@ const docTemplate = `{
                 "EventTypeFatal"
             ]
         },
+        "github_com_leptonai_gpud_api_v1.GPUFabricClique": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "integer"
+                },
+                "type": {
+                    "type": "integer"
+                }
+            }
+        },
         "github_com_leptonai_gpud_api_v1.HealthState": {
             "type": "object",
             "properties": {
@@ -1008,11 +1019,23 @@ const docTemplate = `{
                 "architecture": {
                     "type": "string"
                 },
+                "cpusPerCore": {
+                    "description": "CPUsPerCore is the uniform number of online hardware threads per core.\nOmitted when topology is unavailable or online thread counts are nonuniform.",
+                    "type": "integer"
+                },
                 "logicalCores": {
                     "type": "integer"
                 },
                 "manufacturer": {
                     "type": "string"
+                },
+                "numCores": {
+                    "description": "NumCores is the total physical cores represented by online CPUs across all sockets.\nOmitted when topology is unavailable.",
+                    "type": "integer"
+                },
+                "numSockets": {
+                    "description": "NumSockets is the number of physical sockets represented by online CPUs.\nOmitted when topology or CPU package IDs are unavailable.",
+                    "type": "integer"
                 },
                 "type": {
                     "type": "string"
@@ -1090,11 +1113,58 @@ const docTemplate = `{
                 }
             }
         },
+        "github_com_leptonai_gpud_api_v1.MachineFirmware": {
+            "type": "object",
+            "properties": {
+                "component": {
+                    "description": "Component is one of \"GPU\", \"cx8\", \"cx8-aws\", \"bf3_nic\", \"hmc-sbios\" or \"doca_host\".",
+                    "type": "string"
+                },
+                "instanceNames": {
+                    "description": "InstanceNames names the instances in natural order: \"gpu1\"..\"gpuN\" by PCI bus ID\nfor GPUs, and the InfiniBand device name of each card for NICs.\nOmitted for host-level components (\"hmc-sbios\", \"doca_host\").",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "instances": {
+                    "description": "Instances is the number of instances that run this version.",
+                    "type": "integer"
+                },
+                "lastUpdated": {
+                    "description": "LastUpdated is the UTC time, in whole seconds, of the read that produced this entry.",
+                    "type": "string"
+                },
+                "version": {
+                    "description": "Version is the version string as read on the node, without normalization.",
+                    "type": "string"
+                }
+            }
+        },
         "github_com_leptonai_gpud_api_v1.MachineGPUInfo": {
             "type": "object",
             "properties": {
                 "architecture": {
                     "description": "Architecture is \"blackwell\" for NVIDIA GB200.",
+                    "type": "string"
+                },
+                "chassisSerial": {
+                    "description": "ChassisSerial is the serial number of the chassis that contains the GPUs\nas reported by NVML platform info. Support and operations teams use it to\nfind the physical hardware for repair or replacement.\nEmpty when the platform does not report a chassis serial number.",
+                    "type": "string"
+                },
+                "cliqueID": {
+                    "description": "CliqueID retains the deprecated single-clique wire field for compatibility.\nWith fabric-info V4 it is the first Unicast Pointer clique, never a logical\nendpoint clique. Nil means unavailable; a pointer preserves a valid zero.",
+                    "type": "integer"
+                },
+                "cliques": {
+                    "description": "Cliques contains the typed V4 assignments shared by every GPU on the node.\nOlder APIs cannot supply this list; do not infer other types from CliqueID.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/github_com_leptonai_gpud_api_v1.GPUFabricClique"
+                    }
+                },
+                "clusterUUID": {
+                    "description": "ClusterUUID is the GPU fabric cluster UUID (\"Cluster UUID\" in nvidia-smi -q).\nAll nodes in one NVLink fabric, for example one NVIDIA GB200 NVL72 rack,\nreport the same value. NVIDIA uses it to group nodes by fabric domain.\nCollected with the NVML fabric state API. Empty when the node is not in\nan NVLink fabric.",
                     "type": "string"
                 },
                 "gpus": {
@@ -1112,7 +1182,7 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "product": {
-                    "description": "Product may be \"NVIDIA-Graphics-Device\" for NVIDIA GB200.",
+                    "description": "Product is the driver name with whitespace normalized to hyphens.\nDevelopment Blackwell and Rubin drivers may report \"NVIDIA-Graphics-Device\".",
                     "type": "string"
                 }
             }
@@ -1169,6 +1239,13 @@ const docTemplate = `{
                             "$ref": "#/definitions/github_com_leptonai_gpud_api_v1.MachineDiskInfo"
                         }
                     ]
+                },
+                "firmware": {
+                    "description": "Firmware lists the firmware and host software versions read on the node,\none entry per (component, version), sorted by component and then version.\nGPUd refreshes it at startup and every 4 hours.\nOmitted when nothing was collected; consumers must treat absence as unknown.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/github_com_leptonai_gpud_api_v1.MachineFirmware"
+                    }
                 },
                 "gpuDriverVersion": {
                     "description": "GPUDriverVersion represents the current version of GPU driver installed",

@@ -5,10 +5,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
-	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +18,7 @@ import (
 
 	apiv1 "github.com/leptonai/gpud/api/v1"
 	"github.com/leptonai/gpud/components"
+	configcommon "github.com/leptonai/gpud/pkg/config/common"
 	"github.com/leptonai/gpud/pkg/log"
 	nvidianvml "github.com/leptonai/gpud/pkg/nvidia/nvml"
 	"github.com/leptonai/gpud/pkg/systemd"
@@ -26,29 +27,14 @@ import (
 // Name is the ID of the containerd component.
 const (
 	Name                        = "containerd"
-	defaultContainerdConfigPath = "/etc/containerd/config.toml"
+	danglingDegradedThreshold   = 5
+	danglingUnhealthyThreshold  = 10
+	defaultContainerdConfigPath = configcommon.DefaultContainerdConfigPath
 
 	defaultActivenssCheckUptimeThreshold = 5 * time.Minute
 
 	socketMissingConsecutiveThreshold = 5
-
-	// Containerd config strings to check for NVIDIA runtime configuration.
-	// containerd 1.x uses the "io.containerd.grpc.v1.cri" plugin path; 2.x
-	// uses "io.containerd.cri.v1.runtime". Either is acceptable.
-	containerdConfigNvidiaDefaultRuntime  = `default_runtime_name = "nvidia"`
-	containerdConfigNvidiaRuntimePlugin   = `plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia`
-	containerdConfigNvidiaRuntimePluginV2 = `plugins."io.containerd.cri.v1.runtime".containerd.runtimes.nvidia`
 )
-
-// containerdConfigImportsRe matches `imports = [...]` directives in a
-// containerd config so any drop-in files (e.g. /etc/containerd/conf.d/*.toml
-// written by nvidia-container-toolkit-daemonset) can be inspected too.
-var containerdConfigImportsRe = regexp.MustCompile(`(?m)^\s*imports\s*=\s*\[([^\]]*)\]`)
-
-// containerdConfigCDIEnabledRe matches containerd's native CDI setting.
-// Native CDI allows runc to remain the default runtime while GPU workloads
-// select the configured NVIDIA runtime handler.
-var containerdConfigCDIEnabledRe = regexp.MustCompile(`(?m)^\s*enable_cdi\s*=\s*true\s*(?:#.*)?$`)
 
 var _ components.Component = &component{}
 
@@ -61,6 +47,7 @@ type component struct {
 	getTimeNowFunc                    func() time.Time
 	containerToolkitCreationThreshold time.Duration
 	getContainerdConfigFunc           func() ([]byte, error)
+	getRuntimeConfigFunc              func() ([]byte, error)
 
 	checkDependencyInstalledFunc  func() bool
 	checkSocketExistsFunc         func() bool
@@ -72,10 +59,22 @@ type component struct {
 
 	listAllSandboxesFunc func(ctx context.Context, endpoint string) ([]PodSandbox, error)
 
-	endpoint string
+	listKubeletPodsFunc func(ctx context.Context) ([]kubeletPodStatus, error)
+
+	endpoint        string
+	configPath      string
+	explicitRuntime bool
 
 	socketMissingMu    sync.Mutex
 	socketMissingCount int
+
+	// danglingAbsentSince tracks, per sandbox ID, when the sandbox's pod was
+	// first observed missing from a successfully fetched API server pod list.
+	// Only successful listings update it; query failures are not evidence of
+	// absence.
+	danglingPodAbsentGrace time.Duration
+	danglingMu             sync.Mutex
+	danglingAbsentSince    map[string]time.Time
 
 	lastMu          sync.RWMutex
 	lastCheckResult *checkResult
@@ -83,10 +82,24 @@ type component struct {
 
 // New creates a containerd component.
 func New(gpudInstance *components.GPUdInstance) (components.Component, error) {
+	if gpudInstance.ContainerdDanglingPodGracePeriod < 0 {
+		return nil, errors.New("containerd dangling pod grace period must not be negative")
+	}
+	if err := gpudInstance.Containerd.Validate(); err != nil {
+		return nil, err
+	}
+	runtimeConfig := gpudInstance.Containerd.WithDefaults()
+	socketPath, err := runtimeConfig.SocketPath()
+	if err != nil {
+		return nil, err
+	}
 	cctx, ccancel := context.WithCancel(gpudInstance.RootCtx)
 
 	// Determine the checkSocketExistsFunc based on failure injector configuration
 	checkSocketExistsFunc := CheckSocketExists
+	if !gpudInstance.Containerd.IsZero() {
+		checkSocketExistsFunc = func() bool { return checkSocketExists(socketPath) }
+	}
 	if gpudInstance.FailureInjector != nil && gpudInstance.FailureInjector.ContainerdSocketMissing {
 		// Override to always return false, simulating socket missing
 		checkSocketExistsFunc = func() bool {
@@ -105,7 +118,12 @@ func New(gpudInstance *components.GPUdInstance) (components.Component, error) {
 		},
 		containerToolkitCreationThreshold: 10 * time.Minute,
 		getContainerdConfigFunc: func() ([]byte, error) {
-			return os.ReadFile(defaultContainerdConfigPath)
+			return os.ReadFile(runtimeConfig.ConfigPath)
+		},
+		getRuntimeConfigFunc: func() ([]byte, error) {
+			ctx, cancel := context.WithTimeout(cctx, 5*time.Second)
+			defer cancel()
+			return getRuntimeConfig(ctx, runtimeConfig.Endpoint)
 		},
 
 		checkDependencyInstalledFunc: checkContainerdInstalled,
@@ -122,18 +140,78 @@ func New(gpudInstance *components.GPUdInstance) (components.Component, error) {
 			if gpudInstance.ContainerdServiceActiveCommands != "" {
 				return CheckServiceActiveWithCommand(ctx, gpudInstance.ContainerdServiceActiveCommands)
 			}
-			return systemd.IsActive("containerd")
+			if gpudInstance.Containerd.IsZero() {
+				return systemd.IsActive("containerd")
+			}
+			return anyServiceActive(runtimeConfig.ServiceNames(), runtimeConfig.SystemctlCommands)
 		},
 		getContainerdUptimeFunc: func() (*time.Duration, error) {
-			return systemd.GetUptime("containerd")
+			if gpudInstance.Containerd.IsZero() {
+				return systemd.GetUptime("containerd")
+			}
+			// An arbitrary active-command override does not identify its service manager.
+			// Uptime cannot safely grant startup grace for an unrelated service.
+			if gpudInstance.ContainerdServiceActiveCommands != "" {
+				return nil, nil
+			}
+			return shortestServiceUptime(runtimeConfig.ServiceNames(), runtimeConfig.SystemctlCommands)
 		},
 		activenssCheckUptimeThreshold: defaultActivenssCheckUptimeThreshold,
 
-		listAllSandboxesFunc: ListAllSandboxes,
+		listAllSandboxesFunc:   ListAllSandboxes,
+		danglingPodAbsentGrace: gpudInstance.ContainerdDanglingPodGracePeriod,
 
-		endpoint: DefaultContainerRuntimeEndpoint,
+		listKubeletPodsFunc: func(ctx context.Context) ([]kubeletPodStatus, error) {
+			return listPodsUsingDiscoveredKubeletIdentity(ctx)
+		},
+
+		endpoint:        runtimeConfig.Endpoint,
+		configPath:      runtimeConfig.ConfigPath,
+		explicitRuntime: !gpudInstance.Containerd.IsZero(),
+	}
+	if c.explicitRuntime {
+		c.checkContainerdRunningFunc = func(ctx context.Context) bool { return CheckContainerdRunningAt(ctx, runtimeConfig.Endpoint) }
 	}
 	return c, nil
+}
+
+// anyServiceActive reports whether any unit is active. RKE2 and k3s run
+// containerd under the agent or the server unit depending on the node role.
+func anyServiceActive(units []string, systemctlCommands string) (bool, error) {
+	var errs []error
+	for _, unit := range units {
+		active, err := systemd.IsActiveWithCommand(unit, systemctlCommands)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if active {
+			return true, nil
+		}
+	}
+	return false, errors.Join(errs...)
+}
+
+// shortestServiceUptime returns the most recent start among units that have
+// started, so a just-started unit still gets the activeness grace period.
+// It returns nil when no unit has started.
+func shortestServiceUptime(units []string, systemctlCommands string) (*time.Duration, error) {
+	var shortest *time.Duration
+	var errs []error
+	for _, unit := range units {
+		uptime, err := systemd.GetUptimeWithCommand(unit, systemctlCommands)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if uptime != nil && (shortest == nil || *uptime < *shortest) {
+			shortest = uptime
+		}
+	}
+	if shortest != nil {
+		return shortest, nil
+	}
+	return nil, errors.Join(errs...)
 }
 
 func (c *component) Name() string { return Name }
@@ -260,7 +338,7 @@ func (c *component) Check() components.CheckResult {
 	}()
 
 	// assume "containerd" is not installed, thus not needed to check its activeness
-	if c.checkDependencyInstalledFunc == nil || !c.checkDependencyInstalledFunc() {
+	if !c.explicitRuntime && (c.checkDependencyInstalledFunc == nil || !c.checkDependencyInstalledFunc()) {
 		c.recordSocketMissing(false)
 		cr.health = apiv1.HealthStateTypeHealthy
 		cr.reason = "containerd not installed"
@@ -268,16 +346,16 @@ func (c *component) Check() components.CheckResult {
 	}
 
 	// An installed containerd binary does not make containerd the node's
-	// container runtime: BYOK clusters that use CRI-O still ship the
-	// containerd binary (the gpud image installs containerd.io), but
-	// containerd is never started and its socket never appears. Without this
+	// container runtime: BYOK clusters that use CRI-O can still ship the
+	// containerd binary on the host, but containerd is never started and its
+	// socket never appears. Without this
 	// skip, the activeness check below marks such nodes Unhealthy after five
 	// consecutive misses even though nothing is wrong (LEP-6128).
 	//
 	// CRI-O is probed with a real CRI connection (CheckCRIORunning) rather
 	// than a bare socket stat so a stale socket left by a crashed CRI-O does
 	// not spoof a containerd node into skipping a genuine containerd outage.
-	if c.checkSocketExistsFunc != nil && !c.checkSocketExistsFunc() &&
+	if !c.explicitRuntime && c.checkSocketExistsFunc != nil && !c.checkSocketExistsFunc() &&
 		c.checkCRIORunningFunc != nil {
 		cctx, ccancel := context.WithTimeout(c.ctx, 15*time.Second)
 		crioRunning := c.checkCRIORunningFunc(cctx)
@@ -344,6 +422,45 @@ func (c *component) Check() components.CheckResult {
 			return cr
 		}
 
+		var danglingCount int
+		if c.listKubeletPodsFunc != nil {
+			cctx, ccancel := context.WithTimeout(c.ctx, 30*time.Second)
+			kubeletPods, err := c.listKubeletPodsFunc(cctx)
+			ccancel()
+			switch {
+			case errors.Is(err, errKubeletIdentityNotFound):
+				// Not a Kubernetes node (or kubelet identity not provisioned
+				// yet): detection does not apply, and the skip must be explicit
+				// rather than indistinguishable from a successful comparison
+				// with zero dangling pods.
+				log.Logger.Debugw("kubelet client identity not found; dangling pod detection unavailable")
+				cr.appendReason("kubelet client identity not found; dangling pod detection unavailable")
+			case err != nil:
+				// Auth/network failures surface as unavailability of the
+				// detection itself; they must never read as a dangling-pod
+				// verdict (and thus never trigger a reboot).
+				log.Logger.Errorw("failed to list pods using kubelet client identity", "error", err)
+				cr.appendReason(fmt.Sprintf("dangling pod detection unavailable: %v", err))
+			default:
+				danglingCount = c.danglingPodCount(cr.Pods, kubeletPods, c.getTimeNowFunc())
+			}
+		}
+		switch {
+		case danglingCount > danglingUnhealthyThreshold:
+			cr.health = apiv1.HealthStateTypeUnhealthy
+			cr.reason = fmt.Sprintf("node has %v dangling pods, unhealthy threshold %v", danglingCount, danglingUnhealthyThreshold)
+			cr.suggestedAction = &apiv1.SuggestedActions{
+				Description:   "too many dangling pod",
+				RepairActions: []apiv1.RepairActionType{apiv1.RepairActionTypeRebootSystem},
+			}
+			return cr
+		case danglingCount > danglingDegradedThreshold:
+			cr.health = apiv1.HealthStateTypeDegraded
+			cr.reason = fmt.Sprintf("node has %v dangling pods, consider reboot system to recover, degraded threshold %v", danglingCount, danglingDegradedThreshold)
+			return cr
+		case danglingCount != 0:
+			cr.reason = fmt.Sprintf("node has %v dangling pods", danglingCount)
+		}
 	}
 	log.Logger.Debugw(cr.reason, "count", len(cr.Pods))
 
@@ -379,20 +496,22 @@ func (c *component) Check() components.CheckResult {
 
 			// been running long enough
 			if elapsed > c.containerToolkitCreationThreshold {
-				config, err := c.getContainerdConfigFunc()
-				if err == nil {
-					config = appendImportedContainerdConfigs(config)
-				}
+				configured, err := c.nvidiaRuntimeConfigured()
 				switch {
 				case err != nil:
 					reason := "error getting containerd config"
 					cr.appendReason(reason)
-					log.Logger.Warnw(reason)
-				case !hasNvidiaRuntimeConfiguration(config):
-					reason := fmt.Sprintf("nvidia-container-toolkit pod is running but %s is missing NVIDIA runtime configuration", defaultContainerdConfigPath)
+					log.Logger.Warnw(reason, "error", err)
+				case !configured:
+					configPath := c.configPath
+					if configPath == "" {
+						configPath = defaultContainerdConfigPath
+					}
+					reason := fmt.Sprintf("nvidia-container-toolkit pod is running but %s is missing NVIDIA runtime configuration", configPath)
 					cr.appendReason(reason)
 					log.Logger.Warnw(reason)
 					cr.health = apiv1.HealthStateTypeUnhealthy
+					c.appendRuntimeDiagnostics(cr)
 				default:
 					log.Logger.Debugw("containerd config contains nvidia")
 				}
@@ -518,47 +637,103 @@ func (cr *checkResult) HealthStates() apiv1.HealthStates {
 	return apiv1.HealthStates{state}
 }
 
-// hasNvidiaRuntimeConfiguration accepts both supported toolkit layouts:
-// NVIDIA as containerd's default runtime, or containerd native CDI enabled
-// with an NVIDIA runtime handler. The handler is required in both cases.
-func hasNvidiaRuntimeConfiguration(config []byte) bool {
-	hasNvidiaRuntimePlugin := bytes.Contains(config, []byte(containerdConfigNvidiaRuntimePlugin)) ||
-		bytes.Contains(config, []byte(containerdConfigNvidiaRuntimePluginV2))
-	if !hasNvidiaRuntimePlugin {
-		return false
+// danglingPodCount returns the number of READY sandboxes whose pods have been
+// continuously absent from the API server pod list for at least
+// the configured grace period (zero counts on the first successful comparison).
+//
+// Absence is measured from sustained, successfully observed pod lists, keyed
+// by sandbox ID -- not from sandbox creation time. The observation resets when
+// the pod reappears in the API list, and is forgotten when the sandbox leaves
+// the READY state or disappears. A successfully fetched but empty pod list is
+// authoritative: every READY sandbox is absent then, and each becomes eligible
+// after the grace period. Callers must not invoke this with the result of a
+// failed pod-list query: a failed query is not evidence of absence.
+func (c *component) danglingPodCount(containerdPods []PodSandbox, kubeletPods []kubeletPodStatus, now time.Time) int {
+	c.danglingMu.Lock()
+	defer c.danglingMu.Unlock()
+
+	if c.danglingAbsentSince == nil {
+		c.danglingAbsentSince = make(map[string]time.Time)
 	}
 
-	return bytes.Contains(config, []byte(containerdConfigNvidiaDefaultRuntime)) ||
-		containerdConfigCDIEnabledRe.Match(config)
+	present := make(map[string]struct{}, len(kubeletPods))
+	for _, pod := range kubeletPods {
+		present[fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)] = struct{}{}
+	}
+
+	ready := make(map[string]struct{}, len(containerdPods))
+	danglingCount := 0
+	for _, pod := range containerdPods {
+		if pod.State != "SANDBOX_READY" {
+			continue
+		}
+		// CRI sandboxes always carry an ID; fall back to namespace/name for
+		// defensive completeness.
+		key := pod.ID
+		if key == "" {
+			key = fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
+		}
+		ready[key] = struct{}{}
+
+		if _, ok := present[fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)]; ok {
+			// the pod is known to the API server again: reset the observation
+			delete(c.danglingAbsentSince, key)
+			continue
+		}
+		absentSince, ok := c.danglingAbsentSince[key]
+		if !ok {
+			// Start the optional grace period at the first observed absence.
+			absentSince = now
+			c.danglingAbsentSince[key] = absentSince
+		}
+		if now.Sub(absentSince) >= c.danglingPodAbsentGrace {
+			danglingCount++
+		}
+	}
+
+	// forget sandboxes that disappeared or left the READY state
+	for key := range c.danglingAbsentSince {
+		if _, ok := ready[key]; !ok {
+			delete(c.danglingAbsentSince, key)
+		}
+	}
+
+	return danglingCount
 }
 
-// appendImportedContainerdConfigs returns config with the contents of any
-// files referenced by an "imports = [...]" directive appended. Errors
-// reading individual imports are ignored so the substring checks still
-// run against whatever could be read.
-func appendImportedContainerdConfigs(config []byte) []byte {
-	m := containerdConfigImportsRe.FindSubmatch(config)
-	if len(m) < 2 {
-		return config
+// appendRuntimeDiagnostics explains an existing configuration failure without
+// changing its health verdict or replacing the on-disk checks. READY sandboxes
+// are examples of handler use, not an exhaustive list of workload requirements.
+func (c *component) appendRuntimeDiagnostics(cr *checkResult) {
+	if c.getRuntimeConfigFunc == nil {
+		return
 	}
-	out := config
-	for _, raw := range strings.Split(string(m[1]), ",") {
-		pattern := strings.Trim(strings.TrimSpace(raw), `"'`)
-		if pattern == "" {
+	data, err := c.getRuntimeConfigFunc()
+	var config runtimeConfig
+	if err == nil {
+		config, err = parseRuntimeConfig(data)
+	}
+	if err != nil {
+		cr.appendReason("live containerd runtime diagnostics unavailable")
+		return
+	}
+	handlers := make([]string, 0, len(config.Containerd.Runtimes))
+	for handler := range config.Containerd.Runtimes {
+		handlers = append(handlers, handler)
+	}
+	sort.Strings(handlers)
+	cr.appendReason(fmt.Sprintf("live containerd: native CDI enabled=%t, default handler %q, configured handlers %q", config.EnableCDI, config.Containerd.DefaultRuntimeName, handlers))
+	for _, pod := range cr.Pods {
+		if pod.State != "SANDBOX_READY" {
 			continue
 		}
-		matches, err := filepath.Glob(pattern)
-		if err != nil {
-			continue
+		handler := pod.RuntimeHandler
+		if handler == "" {
+			handler = config.Containerd.DefaultRuntimeName
 		}
-		for _, f := range matches {
-			b, err := os.ReadFile(f)
-			if err != nil {
-				continue
-			}
-			out = append(out, '\n')
-			out = append(out, b...)
+		if _, ok := config.Containerd.Runtimes[handler]; !ok {
+			cr.appendReason(fmt.Sprintf("pod %s/%s requires runtime handler %q, but containerd does not have it configured", pod.Namespace, pod.Name, handler))
+			return
 		}
 	}
-	return out
 }

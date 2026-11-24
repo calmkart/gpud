@@ -26,8 +26,10 @@ import (
 	componentsnfs "github.com/leptonai/gpud/components/nfs"
 	componentsos "github.com/leptonai/gpud/components/os"
 	"github.com/leptonai/gpud/pkg/config"
+	configcommon "github.com/leptonai/gpud/pkg/config/common"
 	pkgcustomplugins "github.com/leptonai/gpud/pkg/custom-plugins"
 	pkgfaultinjector "github.com/leptonai/gpud/pkg/fault-injector"
+	"github.com/leptonai/gpud/pkg/httputil"
 	"github.com/leptonai/gpud/pkg/log"
 	pkgmachineinfo "github.com/leptonai/gpud/pkg/machine-info"
 	pkgmetrics "github.com/leptonai/gpud/pkg/metrics"
@@ -46,6 +48,7 @@ type Op struct {
 	enableAutoUpdate    bool
 	autoUpdateExitCode  int
 	rebootCommands      string
+	containerd          configcommon.ContainerdConfig
 	skipUpdateConfig    bool
 	componentsRegistry  components.Registry
 	dataDir             string
@@ -60,6 +63,11 @@ type Op struct {
 }
 
 type OpOption func(*Op)
+
+// WithContainerd keeps gossip metadata aligned with the monitored runtime.
+func WithContainerd(cfg configcommon.ContainerdConfig) OpOption {
+	return func(op *Op) { op.containerd = cfg }
+}
 
 var ErrAutoUpdateDisabledButExitCodeSet = errors.New("auto update is disabled but auto update by exit code is set")
 
@@ -365,6 +373,7 @@ func NewSession(ctx context.Context, epLocalGPUdServer string, epControlPlane st
 	}
 
 	cctx, ccancel := context.WithCancel(ctx)
+	instanceType := pkgmachineinfo.NewInstanceTypeCollector(cctx)
 	s := &Session{
 		ctx:    cctx,
 		cancel: ccancel,
@@ -387,7 +396,13 @@ func NewSession(ctx context.Context, epLocalGPUdServer string, epControlPlane st
 		dbRW:    op.dbRW,
 		dbRO:    op.dbRO,
 
-		createGossipRequestFunc: pkgmachineinfo.CreateGossipRequest,
+		createGossipRequestFunc: func(machineID string, instance nvidianvml.Instance) (*apiv1.GossipRequest, error) {
+			req, err := pkgmachineinfo.CreateGossipRequestWithContainerd(machineID, instance, op.containerd)
+			if err == nil {
+				req.ProviderInstanceType = instanceType.Latest()
+			}
+			return req, err
+		},
 
 		setDefaultIbExpectedPortStatesFunc:       componentsnvidiainfiniband.SetDefaultExpectedPortStates,
 		setDefaultNVLinkExpectedLinkStatesFunc:   componentsnvidianvlink.SetDefaultExpectedLinkStates,
@@ -504,7 +519,7 @@ func createSessionRequestWithProof(ctx context.Context, epControlPlane, machineI
 	req.Header.Set("X-GPUD-Session-Type", sessionType)
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 	if machineProof != "" {
-		req.Header.Set("X-GPUD-Machine-Proof", machineProof)
+		req.Header.Set(httputil.RequestHeaderMachineProof, machineProof)
 	}
 	req.Header.Set("Origin", origin)
 

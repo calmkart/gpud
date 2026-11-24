@@ -26,6 +26,8 @@ const (
 	// events that happen after a reboot-recoverable XID, and if the same XID is
 	// still asking for RebootSystem after this threshold, gpud treats repeated
 	// reboots as insufficient recovery and recommends hardware inspection.
+	// XID 154 recovery guidance does not diagnose hardware failure and is
+	// excluded from reboot escalation; originating faults retain their thresholds.
 	// Operators can override individual XIDs with --xid-thresholds or session
 	// updateConfig overrides. The legacy --xid-reboot-threshold flag
 	// can still override this global fallback separately.
@@ -35,21 +37,8 @@ const (
 )
 
 var (
-	// XID 94 is application specific and does NOT warrant system reboot as a
-	// system-level repair signal: NVIDIA's XID catalog classifies it as a
-	// contained error whose immediate action is restarting the affected app.
-	// Critical ECC paths are still covered separately: XID 92 reports high
-	// single-bit ECC rate, XID 48/95/140 cover uncorrectable or uncontained ECC,
-	// and XID 63/64 plus the remapped-rows component cover row remapping. Keeping
-	// this override narrow avoids masking those critical hardware signals.
-	defaultOverrides = map[int]ThresholdOverride{
-		94: {RebootThreshold: 1000},
-	}
-
 	defaultThresholdsMu sync.RWMutex
-	defaultThresholds   = Thresholds{
-		Overrides: defaultOverrides,
-	}
+	defaultThresholds   Thresholds
 
 	defaultRebootThresholdMu sync.RWMutex
 	defaultRebootThreshold   = DefaultRebootThreshold
@@ -86,21 +75,12 @@ func GetDefaultThresholds() Thresholds {
 
 // SetDefaultThresholds updates the configured threshold policy for XID recovery.
 func SetDefaultThresholds(thresholds Thresholds) {
-	thresholds = normalizeThresholds(thresholds)
+	thresholds = cloneThresholds(thresholds)
 	log.Logger.Infow("setting default xid thresholds", "overrides", thresholds.Overrides)
 
 	defaultThresholdsMu.Lock()
 	defer defaultThresholdsMu.Unlock()
 	defaultThresholds = thresholds
-}
-
-func normalizeThresholds(thresholds Thresholds) Thresholds {
-	overrides := cloneOverrides(defaultOverrides)
-	for xid, override := range thresholds.Overrides {
-		overrides[xid] = override
-	}
-	thresholds.Overrides = overrides
-	return thresholds
 }
 
 func cloneThresholds(thresholds Thresholds) Thresholds {
@@ -125,9 +105,6 @@ func rebootThresholdForXID(xid uint64, defaultRebootThreshold int, thresholds Th
 		return defaultRebootThreshold
 	}
 
-	if thresholds.Overrides == nil {
-		thresholds.Overrides = defaultOverrides
-	}
 	if override, ok := thresholds.Overrides[xidID]; ok && override.RebootThreshold > 0 {
 		return override.RebootThreshold
 	}

@@ -29,7 +29,6 @@ import (
 	swaggerfiles "github.com/swaggo/files"
 	ginswagger "github.com/swaggo/gin-swagger"
 
-	apiv1 "github.com/leptonai/gpud/api/v1"
 	"github.com/leptonai/gpud/components"
 	"github.com/leptonai/gpud/components/all"
 	_ "github.com/leptonai/gpud/docs/apis"
@@ -37,6 +36,7 @@ import (
 	pkgcustomplugins "github.com/leptonai/gpud/pkg/custom-plugins"
 	"github.com/leptonai/gpud/pkg/eventstore"
 	pkgfaultinjector "github.com/leptonai/gpud/pkg/fault-injector"
+	pkgfirmware "github.com/leptonai/gpud/pkg/firmware"
 	gpudmanager "github.com/leptonai/gpud/pkg/gpud-manager"
 	pkghost "github.com/leptonai/gpud/pkg/host"
 	"github.com/leptonai/gpud/pkg/httputil"
@@ -49,10 +49,15 @@ import (
 	pkgmetricsstore "github.com/leptonai/gpud/pkg/metrics/store"
 	pkgmetricssyncer "github.com/leptonai/gpud/pkg/metrics/syncer"
 	nvidianvml "github.com/leptonai/gpud/pkg/nvidia/nvml"
+	"github.com/leptonai/gpud/pkg/nvsentinel"
 	"github.com/leptonai/gpud/pkg/session"
 	"github.com/leptonai/gpud/pkg/sqlite"
 	pkgupdate "github.com/leptonai/gpud/pkg/update"
 )
+
+// firmwareFirstCollectTimeout bounds how long New waits for the first firmware
+// collection before the session starts.
+const firmwareFirstCollectTimeout = 30 * time.Second
 
 // Server is the gpud main daemon
 type Server struct {
@@ -94,8 +99,9 @@ type Server struct {
 	skipSessionUpdateConfig bool
 	sessionProtocol         string
 
-	pluginSpecsFile string
-	faultInjector   pkgfaultinjector.Injector
+	pluginSpecsFile        string
+	pluginSpecsFileManaged bool
+	faultInjector          pkgfaultinjector.Injector
 }
 
 type UserToken struct {
@@ -258,7 +264,8 @@ func New(ctx context.Context, auditLogger log.AuditLogger, config *lepconfig.Con
 		skipSessionUpdateConfig: config.SkipSessionUpdateConfig,
 		sessionProtocol:         config.SessionProtocol,
 
-		pluginSpecsFile: config.PluginSpecsFile,
+		pluginSpecsFile:        config.PluginSpecsFile,
+		pluginSpecsFileManaged: config.PluginSpecsFileManaged,
 	}
 	defer func() {
 		if retErr != nil {
@@ -295,6 +302,34 @@ func New(ctx context.Context, auditLogger log.AuditLogger, config *lepconfig.Con
 		return nil, fmt.Errorf("failed to create NVML instance: %w", err)
 	}
 
+	// Start early so the first collection overlaps component startup.
+	// It also runs without NVML: CPU-only hosts can report NIC and DOCA versions.
+	firmwareReady := pkgfirmware.Start(ctx, pkgfirmware.Options{
+		NVMLInstance:           nvmlInstance,
+		InfinibandClassRootDir: config.NvidiaToolOverwrites.InfinibandClassRootDir,
+	}, pkgfirmware.DefaultCollectInterval)
+
+	// Start the NVSentinel receiver before component registration.
+	// Components subscribe to it in their constructors, so it must be
+	// ready when they are created.
+	var nvsSource nvsentinel.Source
+	nvsDedupWindow := nvsentinel.DefaultEventDedupWindow
+	if config.NVSentinel != nil {
+		if config.NVSentinel.EventDedupWindow.Duration > 0 {
+			nvsDedupWindow = config.NVSentinel.EventDedupWindow.Duration
+		}
+		if config.NVSentinel.Enabled {
+			socketPath := config.NVSentinel.SocketPath
+			if socketPath == "" {
+				socketPath = nvsentinel.DefaultSocketPath
+			}
+			nvsSource, err = nvsentinel.New(socketPath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to start nvsentinel receiver: %w", err)
+			}
+		}
+	}
+
 	s.gpudInstance = &components.GPUdInstance{
 		RootCtx: ctx,
 
@@ -317,9 +352,14 @@ func New(ctx context.Context, auditLogger log.AuditLogger, config *lepconfig.Con
 		BlockdevUsageCommands: config.BlockdevUsageCommands,
 		NFSHostRoot:           config.NFSHostRoot,
 
-		ContainerdServiceActiveCommands: config.ContainerdServiceActiveCommands,
+		ContainerdServiceActiveCommands:  config.ContainerdServiceActiveCommands,
+		Containerd:                       config.Containerd,
+		ContainerdDanglingPodGracePeriod: config.ContainerdDanglingPodGracePeriod.Duration,
 
 		FailureInjector: config.FailureInjector,
+
+		NVSentinel:                 nvsSource,
+		NVSentinelEventDedupWindow: nvsDedupWindow,
 	}
 	if s.gpudInstance.MachineID == "" {
 		s.gpudInstance.MachineID = pkghost.MachineID()
@@ -342,49 +382,11 @@ func New(ctx context.Context, auditLogger log.AuditLogger, config *lepconfig.Con
 
 	// must be registered before starting the components
 	s.initRegistry = components.NewRegistry(s.gpudInstance)
-	if config.PluginSpecsFile != "" {
-		_, err := stdos.Stat(config.PluginSpecsFile)
-		exists := err == nil
-
-		if exists {
-			specs, err := pkgcustomplugins.LoadSpecs(config.PluginSpecsFile)
-			if err != nil {
-				return nil, fmt.Errorf("failed to load plugin specs: %w", err)
-			}
-
-			for _, spec := range specs {
-				initFunc := spec.NewInitFunc()
-				if initFunc == nil {
-					log.Logger.Errorw("failed to load plugin", "name", spec.ComponentName())
-					continue
-				}
-
-				if spec.PluginType == pkgcustomplugins.SpecTypeInit {
-					s.initRegistry.MustRegister(initFunc)
-					log.Logger.Infow("loaded init plugin", "name", spec.ComponentName())
-				} else {
-					s.componentsRegistry.MustRegister(initFunc)
-					log.Logger.Infow("loaded component plugin", "name", spec.ComponentName())
-				}
-			}
-		} else {
-			log.Logger.Warnw("plugin specs file does not exist, skipping", "path", config.PluginSpecsFile)
+	if err := s.loadPluginSpecs(config.PluginSpecsFile); err != nil {
+		if !config.PluginSpecsFileManaged {
+			return nil, err
 		}
-	}
-
-	// init plugin run only "once", and "before" regular components
-	// thus no need to start
-	for _, c := range s.initRegistry.All() {
-		rs := c.Check()
-		if rs.HealthStateType() != apiv1.HealthStateTypeHealthy {
-			return nil, fmt.Errorf("failed to start init plugin %s: %s", c.Name(), rs.Summary())
-		}
-		log.Logger.Infow("successfully executed init plugin", "name", c.Name(), "summary", rs.Summary())
-
-		debugger, ok := rs.(components.CheckResultDebugger)
-		if ok {
-			fmt.Printf("init plugin debug output %q:\n\n%s\n\n", c.Name(), debugger.Debug())
-		}
+		s.quarantinePluginSpecs(config.PluginSpecsFile, err)
 	}
 
 	// component must be started after initialization
@@ -445,6 +447,13 @@ func New(ctx context.Context, auditLogger log.AuditLogger, config *lepconfig.Con
 		return nil, fmt.Errorf("failed to create local GPUd server endpoint: %w", err)
 	}
 
+	// The control plane replaces the stored machine info on every gossip, so a
+	// session that starts before the first collection would clear firmware
+	// until the next gossip.
+	if !pkgfirmware.WaitFirst(ctx, firmwareReady, firmwareFirstCollectTimeout) {
+		log.Logger.Warnw("starting session before the first firmware collection finished", "timeout", firmwareFirstCollectTimeout)
+	}
+
 	userToken := &UserToken{}
 	go s.updateToken(ctx, metricsSQLiteStore, userToken)
 	go s.startListener(nvmlInstance, syncer, config, router, cert)
@@ -467,6 +476,13 @@ func (s *Server) Stop() {
 			if err := closer.Close(); err != nil {
 				log.Logger.Errorf("failed to close plugin %v: %v", component.Name(), err)
 			}
+		}
+	}
+
+	if s.gpudInstance != nil && s.gpudInstance.NVSentinel != nil {
+		log.Logger.Debugw("closing nvsentinel receiver")
+		if err := s.gpudInstance.NVSentinel.Close(); err != nil {
+			log.Logger.Warnw("failed to close nvsentinel receiver", "error", err)
 		}
 	}
 
@@ -618,6 +634,7 @@ func (s *Server) updateToken(ctx context.Context, metricsStore pkgmetrics.Store,
 			session.WithEnableAutoUpdate(s.enableAutoUpdate),
 			session.WithAutoUpdateExitCode(s.autoUpdateExitCode),
 			session.WithRebootCommands(s.rebootCommands),
+			session.WithContainerd(s.gpudInstance.Containerd),
 			session.WithSkipUpdateConfig(s.skipSessionUpdateConfig),
 			session.WithProtocol(s.sessionProtocol),
 			session.WithComponentsRegistry(s.componentsRegistry),
@@ -626,7 +643,7 @@ func (s *Server) updateToken(ctx context.Context, metricsStore pkgmetrics.Store,
 			session.WithNvidiaInstance(s.gpudInstance.NVMLInstance),
 			session.WithMetricsStore(metricsStore),
 			session.WithSavePluginSpecsFunc(func(ctx context.Context, specs pkgcustomplugins.Specs) (bool, error) {
-				return pkgcustomplugins.SaveSpecs(s.pluginSpecsFile, specs)
+				return s.savePluginSpecs(specs)
 			}),
 			session.WithFaultInjector(s.faultInjector),
 			session.WithDB(s.dbRW, s.dbRO),
@@ -691,6 +708,7 @@ func (s *Server) updateToken(ctx context.Context, metricsStore pkgmetrics.Store,
 				session.WithEnableAutoUpdate(s.enableAutoUpdate),
 				session.WithAutoUpdateExitCode(s.autoUpdateExitCode),
 				session.WithRebootCommands(s.rebootCommands),
+				session.WithContainerd(s.gpudInstance.Containerd),
 				session.WithSkipUpdateConfig(s.skipSessionUpdateConfig),
 				session.WithProtocol(s.sessionProtocol),
 				session.WithComponentsRegistry(s.componentsRegistry),
@@ -699,7 +717,7 @@ func (s *Server) updateToken(ctx context.Context, metricsStore pkgmetrics.Store,
 				session.WithNvidiaInstance(s.gpudInstance.NVMLInstance),
 				session.WithMetricsStore(metricsStore),
 				session.WithSavePluginSpecsFunc(func(ctx context.Context, specs pkgcustomplugins.Specs) (bool, error) {
-					return pkgcustomplugins.SaveSpecs(s.pluginSpecsFile, specs)
+					return s.savePluginSpecs(specs)
 				}),
 				session.WithFaultInjector(s.faultInjector),
 				session.WithDB(s.dbRW, s.dbRO),

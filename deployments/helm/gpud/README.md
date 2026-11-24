@@ -9,6 +9,49 @@ is public. No image pull secret or NGC API key is required.
 Packaged charts derive the image tag from the pushed Git tag through
 `appVersion`; `values.yaml` does not pin a release tag.
 
+## Plugin profile persistence
+
+The default startup command sets
+`--plugin-specs-file=/var/lib/gpud/gpud.plugins.yaml` and
+`--plugin-specs-file-managed`. The chart mounts
+`/var/lib/gpud` from the node as writable persistent storage, so pushed
+plugin profiles survive container restarts and DaemonSet pod replacement.
+The file is optional: when it is missing or empty, GPUd starts normally
+without custom plugins. No placeholder file is required.
+GPUd restarts once after a changed profile is saved; repeated delivery of the
+same profile does not request another restart. Detaching a profile persists
+an empty list and restarts once to remove its components when a profile is loaded.
+
+Incoming profiles are expanded and validated before saving. Invalid intervals,
+missing health plugins, and duplicate component names return an error without
+changing the saved profile or restarting GPUd. With managed-file recovery enabled,
+a file that cannot load or an init plugin that fails moves the profile to
+`gpud.plugins.yaml.invalid`; GPUd starts without that profile's plugins and keeps
+the control-plane session available. Repeated delivery of an unchanged profile
+that failed initialization returns an error instead of restarting again. Send a
+corrected profile to retry. Check the error logs and quarantined file when an
+expected component is missing.
+
+Validate existing attached profiles with `gpud cs` before upgrading, especially
+for BYOK groups. Review init plugins before enabling them: they run during
+startup, and quarantine cannot undo actions a script already performed.
+
+Older charts used the CLI default `/etc/default/gpud.plugins.yaml` without a
+persistent mount. Each profile push could therefore restart GPUd and discard
+the file, causing repeated restarts and missing components. Upgrade the
+**chart and image** to a release containing managed-file recovery. Older images
+do not recognize `--plugin-specs-file-managed`. The control plane re-sends the
+attached profile after reconnection; the old container-local file is not
+migrated. If using `gpud.commandOverride`, include both plugin flags above
+in the replacement command. Standalone/systemd installations retain their
+existing CLI default.
+
+After upgrading, attach a manual plugin, wait for GPUd to reload it, and
+trigger it successfully. Verify restart counts stay stable across several
+profile syncs, then check profile updates, detachment, and pod replacement.
+A rendered chart or a successful Helm upgrade alone does not verify those
+live behaviors.
+
 ## Prerequisites
 
 - Kubernetes 1.19+
@@ -89,6 +132,37 @@ helm install my-gpud gpud/gpud \
   --namespace gpud -f my-values.yaml
 ```
 
+### Upgrading installations without a startup probe
+
+GPUd completes login and machine-info collection before serving `/healthz`.
+Slow or unreachable metadata endpoints can delay startup beyond the liveness
+probe's approximately 30-second budget. The chart's startup probe allows
+approximately five minutes before Kubernetes restarts the container, while
+keeping liveness checks disabled until startup succeeds.
+
+When upgrading an older installation, use the new chart defaults with your
+existing overrides (Helm 3.16.1+):
+
+```bash
+helm upgrade my-gpud gpud/gpud \
+  --namespace gpud \
+  --version "$GPUD_VERSION" \
+  --reset-then-reuse-values
+```
+
+Plain `--reuse-values` retains the old chart defaults and can omit the new
+startup probe. The chart rejects liveness without startup protection. If your
+saved overrides explicitly disable the startup probe, replace that override
+with the `startupProbe` mapping from the new chart's `values.yaml`. Preserve
+any custom listener port in both probes. To intentionally disable probes,
+set both `startupProbe: null` and `livenessProbe: null`.
+
+Before applying, add `--dry-run` and check the rendered GPUd container has
+`startupProbe` with the intended handler and timeout budget. After applying,
+check that the pods become Ready and their restart counts remain stable
+through repeated checks; a successful Helm upgrade alone does not prove
+slow-login recovery.
+
 ### Reboot Support Inside DaemonSet Pods
 
 The chart passes `gpud.rebootCommands` to `gpud run --reboot-commands`. By
@@ -148,6 +222,22 @@ flags it controls (for example `findmnt --target ... --json --df`, or
 `df -T -B1 -P`). They depend on the same chart defaults as `rebootCommands`
 (`hostPID: true`, `securityContext.privileged: true`, `runAsUser: 0`).
 
+Login and gossip read remote mount names, types, and paths from `findmnt`'s
+mount table without querying remote filesystem usage. Remote size and used-byte
+fields use the disk component's last successful background sample, matched by
+command, mount point, source, and filesystem type. Samples expire after five
+minutes; cold starts, disabled NFS checks, or stale/missing samples leave these
+fields zero. This preserves shared-volume capacity reporting after a background
+sample is available without making login or gossip wait for remote I/O. Usage
+and reachability checks remain in the background disk component. If mount inventory cannot be read, GPUd logs a
+warning and retains the local disk inventory. The optional kubelet backing-device
+lookup requests only mount metadata and runs with a deadline; failure leaves
+`containerRootDisk` unset. On Linux, root capacity is queried with
+`df -T -B1 -P -- /`, and ext4 scans use `-t ext4` to exclude other filesystem
+types before probing them. A scan with no ext4 filesystems is an empty result;
+other command failures remain errors. Configure all three command
+prefixes together to keep inventory and usage in the same mount namespace.
+
 Set any of these to `""` to keep GPUd's built-in in-namespace behavior, which is
 appropriate when GPUd runs directly on the host (e.g. as a systemd service) or in
 a non-privileged pod. As with reboot, if `gpud.commandOverride` is set the
@@ -155,6 +245,13 @@ default startup wrapper is bypassed, so include these flags in the override when
 host disk inspection is needed.
 
 ### Containerd Monitoring Inside DaemonSet Pods
+
+When the NVIDIA configuration check fails, GPUd adds live containerd details
+from a bounded verbose CRI status request: CDI support, the default handler,
+and configured handlers. If a READY local sandbox references a missing handler,
+the reason also names that pod and handler. These are supplemental diagnostics;
+they never change the existing health verdict, configuration checks, or startup
+grace period. Pending pods without a sandbox are not covered by these details.
 
 The containerd component checks the host's containerd socket and CRI endpoint,
 reads `/etc/containerd/config.toml` to verify the NVIDIA runtime is configured,
@@ -191,12 +288,144 @@ the containerd check behaves as before. On nodes that run neither containerd
 nor CRI-O, set `gpud.mountContainerd: false` and
 `gpud.containerdServiceActiveCommands: ""`.
 
-### Session Token from a Secret
+On RKE2 and K3s, containerd runs inside the distro's own systemd unit with its
+socket at `/run/k3s/containerd/containerd.sock`. When every
+`gpud.containerd.*` value is empty and the Kubernetes server version carries a
+`+rke2` or `+k3s` suffix (for example `v1.36.3+rke2r1`), the chart configures
+the runtime automatically:
+
+| Setting | RKE2 | K3s |
+|---|---|---|
+| Endpoint | `unix:///run/k3s/containerd/containerd.sock` | `unix:///run/k3s/containerd/containerd.sock` |
+| Config path | `/var/lib/rancher/rke2/agent/etc/containerd/config.toml` | `/var/lib/rancher/k3s/agent/etc/containerd/config.toml` |
+| Service names | `rke2-agent,rke2-server` | `k3s-agent,k3s` |
+
+GPUd queries the units through `nsenter --target 1 --mount -- systemctl` and
+treats containerd as active when either unit is, because agent nodes run
+containerd under the agent unit and server nodes under the server unit. The
+startup grace for a recently started unit still applies. The comma-separated
+service names need a GPUd image from the same release as this chart; older
+images reject them at startup, so set `gpud.containerd.*` explicitly when
+pinning an older `image.tag` on RKE2 or K3s.
+
+When the NVIDIA container toolkit runs on the node, GPUd also checks that the
+containerd config (plus its `imports` drop-ins) registers the `nvidia` runtime
+and either makes it the default or enables CDI. GPUd decodes the TOML, so the
+quoted keys in the RKE2/K3s templates match, and a version 3 config counts as
+CDI-enabled unless it sets `enable_cdi = false`, as containerd 2.x does.
+For a version 2 config with no explicit CDI setting, GPUd uses the running
+containerd CRI status to distinguish the containerd 1.x and 2.x defaults.
+Explicit settings in the config or its imports still take precedence.
+
+The suffix is available only when Helm renders against the cluster's API
+server, as `helm install` and `helm upgrade` do. Client-only renders such as
+`helm template` without `--kube-version` use the stock containerd defaults.
+Setting any `gpud.containerd.*` value turns detection off. Renders on other
+clusters are unchanged.
+
+### Installing on GKE
+
+The DaemonSet uses the `system-node-critical` priority class. GKE admits pods
+with that class only in a namespace that has a ResourceQuota scoped to it, and
+GKE creates this quota in `kube-system` only. In any other namespace the
+DaemonSet creates no pods, and its events show:
+
+```text
+insufficient quota to match these scopes: [{PriorityClass In [system-node-critical system-cluster-critical]}]
+```
+
+Set `criticalPodsQuota.enabled` to let the chart create the quota in the
+release namespace:
+
+```bash
+helm upgrade --install my-gpud gpud/gpud \
+  --set criticalPodsQuota.enabled=true \
+  --create-namespace \
+  --namespace gpud
+```
+
+The quota only admits the priority class. It does not limit how many GPUd pods
+can run. The default is `false`, so installs on other clusters are unchanged.
+
+### NVSentinel Integration
+
+By default the chart enables GPUd's NVSentinel sink: GPUd serves the
+NVSentinel PlatformConnector gRPC API on a unix socket, and the node's
+NVSentinel platform-connector dials it to forward health events
+(Xid/SXid/InfiniBand), which GPUd components then deduplicate against their
+own detection:
+
+```yaml
+gpud:
+  nvsentinel:
+    enabled: true
+    socketPath: /var/run/nvsentinel/gpud.sock
+```
+
+GPUd only listens — it never dials NVSentinel — so nodes without NVSentinel
+are unaffected: the listener idles and components keep using their native
+detection (kmsg, NVML, ...). GPUd is simply ready whenever NVSentinel comes
+online. The socket's parent directory (`/var/run/nvsentinel`) is bind-mounted
+from the host with `DirectoryOrCreate`, which is what lets the
+platform-connector pod — it mounts the same host directory at its own
+`/var/run` — reach the socket at `/var/run/gpud.sock`. On nodes without
+NVSentinel this leaves only an empty host directory.
+
+Requires a gpud image with the LEP-6075 NVSentinel sink (v0.13.0+). On older
+images the unknown `--nvsentinel-endpoint` flag fails startup — set
+`gpud.nvsentinel.enabled: false` when pinning an older `image.tag`. As with
+the other startup flags, if `gpud.commandOverride` is set the default startup
+wrapper is bypassed, so include `--nvsentinel-endpoint` in the override when
+the sink is needed.
+
+### Enabling or Disabling Components
+
+Set `gpud.components` (a list) to control which components run; it is rendered
+to `gpud run --components`. Empty (the default) enables all components.
+
+```yaml
+gpud:
+  # Denylist: disable selected components, keep everything else
+  # (requires a gpud image with the LEP-6439 fix):
+  components: ["-docker", "-library"]
+
+  # Allowlist: run ONLY the listed components:
+  # components: ["containerd", "os", "accelerator-nvidia-error-xid"]
+```
+
+On older gpud images without the LEP-6439 fix, a denylist-only list disables
+ALL components -- use an explicit allowlist there instead.
+
+### Extra Environment Variables
+
+Set `gpud.extraEnv` (a list of Kubernetes `EnvVar`s) to add environment
+variables to the gpud container. Entries are appended after the variables the
+chart manages; prefer the dedicated values (for example `gpud.tokenSecret`)
+over redefining `GPUD_*` variables here.
+
+For example, the DERP latency check (used for region detection at login and by
+the `network-latency` component) also probes the default gateway for port
+mapping: UPnP SSDP `M-SEARCH` (unicast and multicast to `239.255.255.250:1900`),
+NAT-PMP, and PCP. GPUd does not use the result. To turn that probe off, for
+example on hosts whose network datapath runs on a DPU:
+
+```yaml
+gpud:
+  extraEnv:
+    - name: TS_DISABLE_PORTMAPPER
+      value: "true"
+```
+
+### Enrollment Token from a Secret
 
 When `nodeLabelExporter.enabled=true`, the chart's init container can read the
-session token from a node label. To read it from an existing Kubernetes Secret
-instead, set `gpud.tokenSecret`; the token is injected as the `TOKEN` env via
-`secretKeyRef` and takes priority over any token label:
+enrollment token from a node label. To read it from an existing Kubernetes Secret
+instead, set `gpud.tokenSecret`; the enrollment token is injected as `GPUD_TOKEN` via
+`secretKeyRef` and takes priority over any token label. The startup wrapper passes
+it through the environment, keeping it out of logs and process arguments. GPUd
+clears this variable before login or startup so child processes cannot inherit it.
+Use the chart and GPUd image from the same release; when a token is configured,
+the wrapper rejects images whose help does not advertise `GPUD_TOKEN` support:
 
 ```yaml
 gpud:
@@ -214,7 +443,7 @@ gpud:
     create: true
     name: gpud-token
     key: TOKEN
-    value: "<YOUR_GPUD_SESSION_TOKEN>"
+    value: "<YOUR_GPUD_ENROLLMENT_TOKEN>"
 ```
 
 The token is stored in Helm values and release state when `value` is used.
@@ -233,7 +462,7 @@ gpud:
     create: true
     name: gpud-token
     key: TOKEN
-    value: "<YOUR_GPUD_SESSION_TOKEN>"
+    value: "<YOUR_GPUD_ENROLLMENT_TOKEN>"
   # The node also exposes /dev/mem on this platform.
   mountHostDevMem: true
   # reboot / disk (findmnt,lsblk,df) / containerd command overrides and the

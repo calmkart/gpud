@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/utils/ptr"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -463,7 +465,7 @@ func TestDataString(t *testing.T) {
 		FabricStates: []device.FabricStateEntry{
 			{
 				GPUUUID:  "GPU-0",
-				CliqueID: 4026,
+				CliqueID: ptr.To(uint32(4026)),
 				State:    "Completed",
 				Status:   "Success",
 				Health: device.FabricHealthSnapshot{
@@ -627,6 +629,7 @@ type mockNVMLInstance struct {
 	productName         string
 	architecture        string
 	deviceCount         int // Add device count field
+	hostLink            nvidiaproduct.HostLink
 }
 
 func (m *mockNVMLInstance) NVMLExists() bool {
@@ -684,6 +687,15 @@ func (m *mockNVMLInstance) FabricStateSupported() bool {
 
 func (m *mockNVMLInstance) GetMemoryErrorManagementCapabilities() nvidiaproduct.MemoryErrorManagementCapabilities {
 	return nvidiaproduct.MemoryErrorManagementCapabilities{}
+}
+
+// Capabilities derives topology hints like the real instance, while the
+// explicit support fields keep their existing per-test meaning.
+func (m *mockNVMLInstance) Capabilities() nvidiaproduct.Capabilities {
+	caps := nvidiaproduct.CapabilitiesForGPU(m.productName, m.architecture, m.hostLink)
+	caps.FabricManager = m.supportsFM
+	caps.FabricState = m.supportsFabricState
+	return caps
 }
 
 func (m *mockNVMLInstance) Shutdown() error {
@@ -1432,12 +1444,12 @@ func TestCheck_FabricStateUnhealthy_PreservedWhenFabricManagerActive(t *testing.
 	assert.True(t, cr.FabricStateSupported)
 	assert.Equal(t, reason, cr.FabricStateReason)
 	assert.Equal(t, apiv1.HealthStateTypeUnhealthy, cr.health)
-	assert.Equal(t, "NVIDIA H100 80GB HBM3 with unhealthy fabric state: "+reason, cr.reason)
+	assert.Equal(t, "NVIDIA H100 80GB HBM3 with unhealthy fabric state: "+reason+"; fabric manager found and active", cr.reason)
 
 	states := comp.LastHealthStates()
 	require.Len(t, states, 1)
 	assert.Equal(t, apiv1.HealthStateTypeUnhealthy, states[0].Health)
-	assert.Equal(t, "NVIDIA H100 80GB HBM3 with unhealthy fabric state: "+reason, states[0].Reason)
+	assert.Equal(t, "NVIDIA H100 80GB HBM3 with unhealthy fabric state: "+reason+"; fabric manager found and active", states[0].Reason)
 }
 
 func TestCheck_FabricStateSupported_SkipsLegacyFMForGB200(t *testing.T) {
@@ -1502,7 +1514,7 @@ func TestCheck_FabricStateUnhealthy_H100_NVSwitchNotDetected(t *testing.T) {
 			return fabricStateReport{
 				Entries: []device.FabricStateEntry{{
 					GPUUUID:     "GPU-69286978-549f-ba17-1b9f-01a31877dfac",
-					CliqueID:    3672582764,
+					CliqueID:    ptr.To(uint32(3672582764)),
 					ClusterUUID: "657f0000-1900-0000-0000-000090adff9d",
 					State:       "Not Supported",
 					Status:      "Unknown Error",
@@ -1581,4 +1593,56 @@ func TestCheck_FabricStateUnhealthyLogging(t *testing.T) {
 	// but we can verify the behavior is correct
 	assert.True(t, cr.FabricStateSupported)
 	assert.Equal(t, "test unhealthy reason", cr.FabricStateReason)
+}
+
+func TestCheckFMExistsInRoots(t *testing.T) {
+	// no driver roots mounted (bare metal without the binary): not found
+	assert.False(t, checkFMExistsInRoots(nil))
+
+	tmp := t.TempDir()
+
+	// driver root without the binary: not found
+	assert.False(t, checkFMExistsInRoots([]string{tmp}))
+
+	// GPU Operator layout: <root>/usr/bin/nv-fabricmanager (LEP-6440: this is
+	// where the operator's driver DaemonSet installs it, mounted at
+	// /run/nvidia/driver by the gpud chart)
+	fmPath := filepath.Join(tmp, "usr", "bin", "nv-fabricmanager")
+	require.NoError(t, os.MkdirAll(filepath.Dir(fmPath), 0o755))
+	require.NoError(t, os.WriteFile(fmPath, []byte("#!/bin/sh\n"), 0o755))
+	assert.True(t, checkFMExistsInRoots([]string{tmp}))
+
+	// a directory named nv-fabricmanager must not count
+	other := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(other, "usr", "bin", "nv-fabricmanager"), 0o755))
+	assert.False(t, checkFMExistsInRoots([]string{other}))
+}
+
+func TestFabricManagerProcessRunning(t *testing.T) {
+	// empty proc root: not running
+	tmp := t.TempDir()
+	assert.False(t, processRunning(tmp, "nv-fabricmanager"))
+
+	// a non-FM process: not running
+	pidDir := filepath.Join(tmp, "1234")
+	require.NoError(t, os.MkdirAll(pidDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(pidDir, "cmdline"), []byte("/usr/bin/kubelet\x00--v=2\x00"), 0o644))
+	assert.False(t, processRunning(tmp, "nv-fabricmanager"))
+
+	// non-numeric entries are skipped
+	require.NoError(t, os.WriteFile(filepath.Join(tmp, "bus"), []byte{}, 0o644))
+	assert.False(t, processRunning(tmp, "nv-fabricmanager"))
+
+	// FM running inside another container with an absolute argv[0]:
+	// nv-fabricmanager -c /usr/share/nvidia/nvswitch/fabricmanager.cfg
+	// (the shape observed on GPU Operator-managed clusters, LEP-6440)
+	fmPidDir := filepath.Join(tmp, "39063")
+	require.NoError(t, os.MkdirAll(fmPidDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(fmPidDir, "cmdline"), []byte("nv-fabricmanager\x00-c\x00/usr/share/nvidia/nvswitch/fabricmanager.cfg\x00"), 0o644))
+	assert.True(t, processRunning(tmp, "nv-fabricmanager"))
+	// The same scan must not report a different daemon such as nvidia-imex.
+	assert.False(t, processRunning(tmp, "nvidia-imex"))
+
+	// nonexistent proc root: not running, no error propagation
+	assert.False(t, processRunning(filepath.Join(tmp, "does-not-exist"), "nv-fabricmanager"))
 }

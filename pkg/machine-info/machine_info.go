@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,7 +25,9 @@ import (
 	componentcontainerd "github.com/leptonai/gpud/components/containerd"
 	componenttailscale "github.com/leptonai/gpud/components/tailscale"
 	"github.com/leptonai/gpud/pkg/asn"
+	configcommon "github.com/leptonai/gpud/pkg/config/common"
 	"github.com/leptonai/gpud/pkg/disk"
+	pkgfirmware "github.com/leptonai/gpud/pkg/firmware"
 	pkghost "github.com/leptonai/gpud/pkg/host"
 	"github.com/leptonai/gpud/pkg/log"
 	"github.com/leptonai/gpud/pkg/netutil"
@@ -34,6 +37,7 @@ import (
 	"github.com/leptonai/gpud/pkg/providers"
 	pkgprovidersall "github.com/leptonai/gpud/pkg/providers/all"
 	"github.com/leptonai/gpud/pkg/providers/nebius"
+	"github.com/leptonai/gpud/pkg/providers/nscale"
 	"github.com/leptonai/gpud/version"
 )
 
@@ -70,7 +74,26 @@ func currentGOOS() string {
 	return runtime.GOOS
 }
 
+// getFirmwareSnapshot only reads the cache that the server refreshes in the
+// background, so building machine info never waits on VBIOS or sysfs reads.
+var getFirmwareSnapshot = pkgfirmware.Latest
+
 func GetMachineInfo(nvmlInstance nvidianvml.Instance) (*apiv1.MachineInfo, error) {
+	return getMachineInfo(nvmlInstance, configcommon.ContainerdConfig{})
+}
+
+// GetMachineInfoWithContainerd reports the same runtime that the health component monitors.
+func GetMachineInfoWithContainerd(nvmlInstance nvidianvml.Instance, cfg configcommon.ContainerdConfig) (*apiv1.MachineInfo, error) {
+	if cfg.IsZero() {
+		return GetMachineInfo(nvmlInstance)
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return getMachineInfo(nvmlInstance, cfg)
+}
+
+func getMachineInfo(nvmlInstance nvidianvml.Instance, containerdConfig configcommon.ContainerdConfig) (*apiv1.MachineInfo, error) {
 	hostname, _ := os.Hostname()
 	info := &apiv1.MachineInfo{
 		GPUdVersion: version.Version,
@@ -90,6 +113,7 @@ func GetMachineInfo(nvmlInstance nvidianvml.Instance) (*apiv1.MachineInfo, error
 		CPUInfo:    GetMachineCPUInfo(),
 		MemoryInfo: GetMachineMemoryInfo(),
 		NICInfo:    GetMachineNICInfo(),
+		Firmware:   getFirmwareSnapshot(),
 	}
 
 	var err error
@@ -102,7 +126,7 @@ func GetMachineInfo(nvmlInstance nvidianvml.Instance) (*apiv1.MachineInfo, error
 	// Machine.Status.MachineInfo.GPUInfo. Keep the producer wire shape aligned
 	// with that CRD shape so gpud-manager can unmarshal and persist them.
 	if info.GPUInfo != nil {
-		info.GPUInfo.ClusterUUID, info.GPUInfo.CliqueID = getGPUFabricIdentifiers(nvmlInstance)
+		info.GPUInfo.ClusterUUID, info.GPUInfo.CliqueID, info.GPUInfo.Cliques = getGPUFabricIdentifiers(nvmlInstance)
 		info.GPUInfo.ChassisSerial = getGPUChassisSerial(nvmlInstance)
 	}
 
@@ -115,8 +139,15 @@ func GetMachineInfo(nvmlInstance nvidianvml.Instance) (*apiv1.MachineInfo, error
 			return nil, fmt.Errorf("failed to get machine disk info: %w", err)
 		}
 
-		if componentcontainerd.CheckContainerdInstalled() && componentcontainerd.CheckContainerdRunning(ctx) {
-			containerdVersion, err := componentcontainerd.GetVersion(ctx, componentcontainerd.DefaultContainerRuntimeEndpoint)
+		endpoint := containerdConfig.WithDefaults().Endpoint
+		var containerdRunning bool
+		if containerdConfig.IsZero() {
+			containerdRunning = componentcontainerd.CheckContainerdInstalled() && componentcontainerd.CheckContainerdRunning(ctx)
+		} else {
+			containerdRunning = componentcontainerd.CheckContainerdRunningAt(ctx, endpoint)
+		}
+		if containerdRunning {
+			containerdVersion, err := componentcontainerd.GetVersion(ctx, endpoint)
 			if err != nil {
 				log.Logger.Warnw("failed to check containerd version", "error", err)
 			} else {
@@ -131,7 +162,7 @@ func GetMachineInfo(nvmlInstance nvidianvml.Instance) (*apiv1.MachineInfo, error
 		// so the block above leaves the runtime version empty even though the
 		// node has a live runtime. Fall back to CRI-O so the reported runtime
 		// reflects what actually runs the node's containers (LEP-6128).
-		if info.ContainerRuntimeVersion == "" && componentcontainerd.CheckCRIORunning(ctx) {
+		if containerdConfig.IsZero() && info.ContainerRuntimeVersion == "" && componentcontainerd.CheckCRIORunning(ctx) {
 			crioVersion, err := componentcontainerd.GetVersion(ctx, componentcontainerd.DefaultCRIOEndpoint)
 			if err != nil {
 				log.Logger.Warnw("failed to check cri-o version", "error", err)
@@ -182,25 +213,18 @@ func GetSystemResourceRootVolumeTotal() (string, error) {
 
 	commands := getDiskCommands()
 	var usage *disk.Usage
-	if commands.blockdevUsageCommand == "" {
+	if currentGOOS() != "linux" && commands.blockdevUsageCommand == "" {
 		var err error
 		usage, err = disk.GetUsage(ctx, "/")
 		if err != nil {
 			return "", fmt.Errorf("failed to get disk usage: %w", err)
 		}
 	} else {
-		partitions, err := disk.GetPartitions(
-			ctx,
-			disk.WithMountPoint(func(mountPoint string) bool { return mountPoint == "/" }),
-			disk.WithBlockdevUsageCommand(commands.blockdevUsageCommand),
-		)
+		var err error
+		usage, err = disk.GetUsageWithCommand(ctx, "/", commands.blockdevUsageCommand)
 		if err != nil {
 			return "", fmt.Errorf("failed to get disk usage: %w", err)
 		}
-		if len(partitions) == 0 || partitions[0].Usage == nil {
-			return "", fmt.Errorf("failed to get disk usage: root partition not found")
-		}
-		usage = partitions[0].Usage
 	}
 
 	qty := resource.NewQuantity(uint64ToInt64Capped(usage.TotalBytes), resource.DecimalSI)
@@ -217,13 +241,23 @@ func GetMachineCPUInfo() *apiv1.MachineCPUInfo {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// counting the number of logical CPU cores available to the system
-	// same as "nproc --all"
+	// Preserve the existing logical CPU count independently of physical topology.
 	cnt, err := cpu.CountsWithContext(ctx, true)
 	if err != nil {
 		log.Logger.Errorw("failed to get logical CPU cores count", "error", err)
 	}
 	info.LogicalCores = int64(cnt)
+
+	if currentGOOS() == "linux" {
+		topology, err := readCPUTopology(ctx, os.DirFS("/sys/devices/system/cpu"))
+		if err != nil {
+			log.Logger.Warnw("failed to get CPU topology", "error", err)
+		} else {
+			info.CPUsPerCore = topology.cpusPerCore
+			info.NumCores = topology.numCores
+			info.NumSockets = topology.numSockets
+		}
+	}
 
 	return info
 }
@@ -254,11 +288,16 @@ func GetMachineNICInfo() *apiv1.MachineNICInfo {
 			// carrying the only RFC1918 address. login_request.go relies on this list
 			// as a fallback when provider metadata does not return a usable private IP.
 			"cali",
+			"cilium", // cilium_host/cilium_net/cilium_vxlan: Cilium router and overlay links
 			"cni",
 			"docker",
 			"flannel",
+			"lxc", // Cilium per-pod veths, including lxc_health
 			"nodelocaldns",
 			"tailscale",
+			// BlueField rshim host<->DPU link; rshim setups commonly assign
+			// 192.168.100.0/30 here, which is not a host LAN address.
+			"tmfifo",
 			"tunl",
 			"veth",
 			"vxlan",
@@ -300,16 +339,23 @@ func GetProvider(publicIP string) *providers.Info {
 
 // GetProviderWithContext passes the caller's context to metadata provider detection.
 func GetProviderWithContext(ctx context.Context, publicIP string) *providers.Info {
-	return getProviderWithContext(ctx, publicIP, pkgprovidersall.Detect)
+	return getProviderWithContext(ctx, publicIP, "", pkgprovidersall.Detect)
 }
 
-func getProviderForLogin(publicIP, region string) *providers.Info {
-	return getProviderWithContext(context.Background(), publicIP, func(ctx context.Context) (*providers.Info, error) {
-		return pkgprovidersall.DetectWithRegionOverride(ctx, region)
+func getProviderForLogin(publicIP, region, instanceID string) *providers.Info {
+	return getProviderWithContext(context.Background(), publicIP, instanceID, func(ctx context.Context) (*providers.Info, error) {
+		return pkgprovidersall.DetectWithOverrides(ctx, region, instanceID)
 	})
 }
 
-func getProviderWithContext(ctx context.Context, publicIP string, detect func(context.Context) (*providers.Info, error)) *providers.Info {
+func getProviderWithContext(ctx context.Context, publicIP, instanceIDOverride string, detect func(context.Context) (*providers.Info, error)) *providers.Info {
+	// Read local identity before network discovery so ASN availability cannot
+	// prevent recovery. Select it only after applying provider-specific rules.
+	fallbackInstanceID := ""
+	if instanceIDOverride == "" {
+		fallbackInstanceID = readInstanceIDFallback(instanceIDFallbackPaths)
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	providerInfo, err := detect(ctx)
@@ -325,8 +371,12 @@ func getProviderWithContext(ctx context.Context, publicIP string, detect func(co
 			Provider: "unknown",
 		}
 	}
+	if instanceIDOverride != "" {
+		providerInfo.InstanceID = instanceIDOverride
+	}
+	// Detection success alone does not establish public-IP metadata support or read success.
 	if providerInfo.PublicIP == "" {
-		providerInfo.PublicIP = publicIP
+		providerInfo.PublicIP = assignedPublicIP(publicIP)
 	}
 	if providerInfo.Provider == "" {
 		log.Logger.Debugw("providerInfo.Provider is empty, setting to unknown")
@@ -350,19 +400,18 @@ func getProviderWithContext(ctx context.Context, publicIP string, detect func(co
 		asnResult, err := asn.GetASLookup(publicIP)
 		if err != nil {
 			log.Logger.Warnw("ASN lookup failed", "error", err, "publicIP", publicIP)
-			return providerInfo
-		}
-
-		normalizedProvider := asn.NormalizeASNName(asnResult.AsnName)
-		log.Logger.Debugw("ASN lookup result", "asnResult", asnResult, "asnName", asnResult.AsnName, "normalizedProvider", normalizedProvider)
-
-		// Ensure we don't set an empty provider
-		if normalizedProvider != "" {
-			providerInfo.Provider = normalizedProvider
 		} else {
-			// as lookup succeeded but normalized provider is empty
-			providerInfo.Provider = asnResult.AsnName
-			log.Logger.Warnw("normalized provider is empty -- fallback to raw asn name for provider name", "asnName", asnResult.AsnName)
+			normalizedProvider := asn.NormalizeASNName(asnResult.AsnName)
+			log.Logger.Debugw("ASN lookup result", "asnResult", asnResult, "asnName", asnResult.AsnName, "normalizedProvider", normalizedProvider)
+
+			// Ensure we don't set an empty provider
+			if normalizedProvider != "" {
+				providerInfo.Provider = normalizedProvider
+			} else {
+				// as lookup succeeded but normalized provider is empty
+				providerInfo.Provider = asnResult.AsnName
+				log.Logger.Warnw("normalized provider is empty -- fallback to raw asn name for provider name", "asnName", asnResult.AsnName)
+			}
 		}
 	} else {
 		log.Logger.Warnw("no public IP provided for ASN lookup")
@@ -382,6 +431,24 @@ func getProviderWithContext(ctx context.Context, publicIP string, detect func(co
 		}
 	}
 
+	if providerInfo.Provider == nscale.Name {
+		populateNscaleProviderInfo(ctx, providerInfo)
+	}
+
+	// No provider metadata service supplied an instance ID (e.g. bare metal
+	// without IMDS), so fall back to the ID cloud-init recorded on the host.
+	// Skip nscale: its cloud-init config drive writes the OpenStack server UUID
+	// to /var/lib/cloud/data/instance-id, whereas nscale's topology and breakfix
+	// APIs identify machines by the "i-<hex>" ID from 169.254.169.254.
+	if providerInfo.InstanceID == "" && providerInfo.Provider != nscale.Name {
+		// Lambda's API and Kubernetes providerID ("lambda://<id>") use the
+		// 32-hex form of the ID that cloud-init stores as a UUID.
+		if providerInfo.Provider == "lambda" {
+			fallbackInstanceID = strings.ReplaceAll(fallbackInstanceID, "-", "")
+		}
+		providerInfo.InstanceID = fallbackInstanceID
+	}
+
 	log.Logger.Debugw("GetProvider returning",
 		"provider", providerInfo.Provider,
 		"publicIP", providerInfo.PublicIP,
@@ -390,6 +457,46 @@ func getProviderWithContext(ctx context.Context, publicIP string, detect func(co
 	)
 
 	return providerInfo
+}
+
+// populateNscaleProviderInfo populates NScale metadata from IMDS when initial
+// OpenStack metadata detection failed (e.g. transient 503 or timeout) and ASN
+// lookup identified the host as nscale. It also marks IMDSDetected so login
+// fails fast rather than registering without an instance ID.
+func populateNscaleProviderInfo(ctx context.Context, providerInfo *providers.Info) {
+	providerInfo.IMDSDetected = true
+	if providerInfo.InstanceID == "" {
+		instanceID, err := nscale.GetInstanceID(ctx)
+		if err != nil {
+			log.Logger.Warnw("failed to get nscale instance ID", "error", err)
+		} else {
+			providerInfo.InstanceID = instanceID
+		}
+	}
+	if providerInfo.PrivateIP == "" {
+		privateIP, err := nscale.PrivateIPv4(ctx)
+		if err != nil {
+			log.Logger.Warnw("failed to get nscale private IP", "error", err)
+		} else {
+			providerInfo.PrivateIP = privateIP
+		}
+	}
+	if strings.TrimSpace(providerInfo.Region) == "" {
+		region, err := nscale.Region(ctx)
+		if err != nil {
+			log.Logger.Warnw("failed to get nscale region", "error", err)
+		} else {
+			providerInfo.Region = strings.TrimSpace(region)
+		}
+	}
+	if providerInfo.VMEnvironment == "" {
+		vmEnv, err := nscale.VMEnvironment(ctx)
+		if err != nil {
+			log.Logger.Warnw("failed to get nscale VM environment", "error", err)
+		} else {
+			providerInfo.VMEnvironment = vmEnv
+		}
+	}
 }
 
 func canonicalizeProviderName(provider string) string {
@@ -450,22 +557,51 @@ func GetSystemResourceGPUCount(nvmlInstance nvidianvml.Instance) (string, error)
 	return qty.String(), nil
 }
 
-// getGPUFabricIdentifiers returns the NVLink fabric cluster UUID and clique ID
-// of the machine (e.g., NVIDIA GB200 NVL72). All GPUs on the same machine share
-// these identifiers, so the first device with a readable fabric state is
-// sufficient. Fabric state telemetry is not supported on all platforms; in
-// that case this function returns empty values and does not fail.
-func getGPUFabricIdentifiers(nvmlInstance nvidianvml.Instance) (string, *uint32) {
+// getGPUFabricIdentifiers returns the NVLink fabric cluster UUID and clique assignments
+// of the machine (e.g., NVIDIA GB200 NVL72). It returns them only when every
+// GPU has readable, completed fabric registration and all
+// of them report the same values. Fabric state telemetry is not supported on
+// all platforms; in that case this function returns empty values and does not
+// fail.
+//
+// The GPUs of a machine share these identifiers while they are in one NVLink
+// partition. While a rack's partition is down, each GPU can report a clique
+// of its own. None of those cliques identifies the machine's NVLink domain,
+// and picking one would make the result depend on map iteration order, so
+// nothing is reported until the GPUs agree again.
+//
+// A non-fabric GPU can still report a zeroed fabric state (SUCCESS with
+// CliqueId 0 and an empty ClusterUuid) instead of an error, so an empty
+// cluster UUID means the node is not in a fabric: the clique ID must stay
+// unreported, because clique 0 on the wire is indistinguishable from a real
+// clique 0 and groups unrelated nodes into one false clique (LEP-6676).
+func getGPUFabricIdentifiers(nvmlInstance nvidianvml.Instance) (string, *uint32, []apiv1.GPUFabricClique) {
+	var clusterUUID string
+	var cliqueID *uint32
+	var cliques []apiv1.GPUFabricClique
 	for uuid, dev := range nvmlInstance.Devices() {
 		fabricState, err := dev.GetFabricState()
 		if err != nil {
-			log.Logger.Debugw("failed to get GPU fabric state for machine info", "uuid", uuid, "error", err)
+			// Partial observations cannot establish agreement across the whole node.
+			log.Logger.Debugw("failed to get gpu fabric state for machine info", "uuid", uuid, "error", err)
+			return "", nil, nil
+		}
+		if fabricState.ClusterUUID == "" || fabricState.State != nvml.GPU_FABRIC_STATE_COMPLETED || fabricState.Status != nvml.SUCCESS {
+			return "", nil, nil
+		}
+		legacy := fabricState.LegacyCliqueID()
+		if clusterUUID == "" {
+			clusterUUID, cliqueID, cliques = fabricState.ClusterUUID, legacy, fabricState.Cliques
 			continue
 		}
-		cliqueID := fabricState.CliqueID
-		return fabricState.ClusterUUID, &cliqueID
+		// Equal pointer IDs do not establish agreement on Logical Endpoint cliques.
+		legacyEqual := (legacy == nil && cliqueID == nil) || (legacy != nil && cliqueID != nil && *legacy == *cliqueID)
+		if fabricState.ClusterUUID != clusterUUID || !legacyEqual || !slices.Equal(fabricState.Cliques, cliques) {
+			log.Logger.Warnw("gpus report different fabric identifiers, omitting them from machine info", "uuid", uuid)
+			return "", nil, nil
+		}
 	}
-	return "", nil
+	return clusterUUID, cliqueID, cliques
 }
 
 // getGPUChassisSerial returns the chassis serial reported by NVML platform
@@ -588,18 +724,22 @@ func GetMachineDiskInfo(ctx context.Context) (*apiv1.MachineDiskInfo, error) {
 		})
 	}
 
-	// track nfs partitions only with available fields
+	// Remote inventory must not depend on filesystem responsiveness. Usage and
+	// reachability belong to the background health checks, not login or gossip.
 	if currentGOOS() == "linux" {
 		timeoutCtx, cancel := context.WithTimeout(ctx, diskPartitionsTimeout)
-		nfsParts, err := disk.GetPartitions(
+		nfsParts, err := disk.GetMounts(
 			timeoutCtx,
 			disk.WithFstype(disk.DefaultNFSFsTypeFunc),
 			disk.WithMountPoint(disk.DefaultMountPointFunc),
-			disk.WithBlockdevUsageCommand(commands.blockdevUsageCommand),
+			disk.WithFindmntCommand(commands.findmntCommand),
 		)
 		cancel()
 		if err != nil {
-			return nil, err
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			log.Logger.Warnw("failed to collect remote mount inventory", "error", err)
 		}
 		for _, part := range nfsParts {
 			dev := apiv1.MachineDiskDevice{
@@ -608,9 +748,9 @@ func GetMachineDiskInfo(ctx context.Context) (*apiv1.MachineDiskInfo, error) {
 				MountPoint: part.MountPoint,
 				FSType:     part.Fstype,
 			}
-			if part.Usage != nil {
-				dev.Size = uint64ToInt64Capped(part.Usage.TotalBytes)
-				dev.Used = uint64ToInt64Capped(part.Usage.UsedBytes)
+			if usage := disk.CachedNFSUsage(commands.blockdevUsageCommand, part); usage != nil {
+				dev.Size = uint64ToInt64Capped(usage.TotalBytes)
+				dev.Used = uint64ToInt64Capped(usage.UsedBytes)
 			}
 			rs = append(rs, dev)
 		}
@@ -621,30 +761,19 @@ func GetMachineDiskInfo(ctx context.Context) (*apiv1.MachineDiskInfo, error) {
 	}
 
 	if currentGOOS() == "linux" {
-		kubeletRootExists := commands.findmntCommand != ""
-		if !kubeletRootExists {
-			_, serr := os.Stat("/var/lib/kubelet")
-			if serr != nil && !os.IsNotExist(serr) {
-				return nil, serr
-			}
-			kubeletRootExists = serr == nil
+		// This optional lookup may need to resolve a path on an unresponsive
+		// mount. Keep all path resolution in a bounded subprocess, and do not
+		// request usage merely to identify the backing device.
+		timeoutCtx, cancel := context.WithTimeout(ctx, diskPartitionsTimeout)
+		source, err := disk.FindMountSource(timeoutCtx, "/var/lib/kubelet", commands.findmntCommand)
+		cancel()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
-		if kubeletRootExists {
-			var out *disk.FindMntOutput
-			var err error
-			if commands.findmntCommand == "" {
-				out, err = disk.FindMnt(ctx, "/var/lib/kubelet")
-			} else {
-				out, err = disk.FindMntWithCommand(ctx, "/var/lib/kubelet", commands.findmntCommand)
-			}
-			if err != nil {
-				if commands.findmntCommand == "" {
-					return nil, err
-				}
-				log.Logger.Warnw("failed to find container root disk", "error", err)
-			} else if len(out.Filesystems) > 0 && len(out.Filesystems[0].Sources) > 0 {
-				info.ContainerRootDisk = out.Filesystems[0].Sources[0]
-			}
+		if err != nil {
+			log.Logger.Debugw("failed to find container root disk", "error", err)
+		} else {
+			info.ContainerRootDisk = source
 		}
 	}
 

@@ -3,7 +3,10 @@ package machineinfo
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"net"
+	"os"
+	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
@@ -15,12 +18,14 @@ import (
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	apiv1 "github.com/leptonai/gpud/api/v1"
 	"github.com/leptonai/gpud/pkg/asn"
 	"github.com/leptonai/gpud/pkg/disk"
 	pkghost "github.com/leptonai/gpud/pkg/host"
 	"github.com/leptonai/gpud/pkg/netutil"
 	"github.com/leptonai/gpud/pkg/netutil/latency"
 	pkgnetutillatencyedge "github.com/leptonai/gpud/pkg/netutil/latency/edge"
+	nvidianvml "github.com/leptonai/gpud/pkg/nvidia/nvml"
 	"github.com/leptonai/gpud/pkg/nvidia/nvml/device"
 	nvmllib "github.com/leptonai/gpud/pkg/nvidia/nvml/lib"
 	nvidiapci "github.com/leptonai/gpud/pkg/nvidia/pci"
@@ -28,6 +33,7 @@ import (
 	"github.com/leptonai/gpud/pkg/providers"
 	pkgprovidersall "github.com/leptonai/gpud/pkg/providers/all"
 	"github.com/leptonai/gpud/pkg/providers/nebius"
+	"github.com/leptonai/gpud/pkg/providers/nscale"
 )
 
 // mockNvmlInstanceForMockey implements the nvidianvml.Instance interface for mockey tests
@@ -54,6 +60,14 @@ func (m *mockNvmlInstanceForMockey) DriverMajor() int                  { return 
 func (m *mockNvmlInstanceForMockey) CUDAVersion() string               { return m.cudaVersion }
 func (m *mockNvmlInstanceForMockey) FabricManagerSupported() bool      { return m.fabricSupported }
 func (m *mockNvmlInstanceForMockey) FabricStateSupported() bool        { return m.fabricSupported }
+func (m *mockNvmlInstanceForMockey) Capabilities() nvidiaproduct.Capabilities {
+	// Preserve the fixture's fabric toggle for consumers of the unified capabilities.
+	return nvidiaproduct.Capabilities{
+		MemoryManagement: m.GetMemoryErrorManagementCapabilities(),
+		FabricManager:    m.fabricSupported,
+		FabricState:      m.fabricSupported,
+	}
+}
 func (m *mockNvmlInstanceForMockey) GetMemoryErrorManagementCapabilities() nvidiaproduct.MemoryErrorManagementCapabilities {
 	return nvidiaproduct.MemoryErrorManagementCapabilities{}
 }
@@ -190,6 +204,55 @@ func TestGetMachineCPUInfo_WithMockedCPU(t *testing.T) {
 	})
 }
 
+func TestGetMachineCPUInfo_Topology(t *testing.T) {
+	tests := []struct {
+		name      string
+		goos      string
+		topology  cpuTopology
+		err       error
+		wantCalls int
+	}{
+		{
+			name:      "measured Linux topology preserves logical count",
+			goos:      "linux",
+			topology:  cpuTopology{cpusPerCore: 2, numCores: 4, numSockets: 2},
+			wantCalls: 1,
+		},
+		{
+			name:      "unknown topology does not fail CPU info",
+			goos:      "linux",
+			err:       errors.New("topology unavailable"),
+			wantCalls: 1,
+		},
+		{
+			name: "non-Linux topology is not guessed",
+			goos: "darwin",
+		},
+	}
+	for _, tt := range tests {
+		mockey.PatchConvey(tt.name, t, func() {
+			mockey.Mock(currentGOOS).Return(tt.goos).Build()
+			mockey.Mock(cpu.CountsWithContext).To(func(_ context.Context, logical bool) (int, error) {
+				assert.True(t, logical)
+				return 128, nil
+			}).Build()
+			calls := 0
+			mockey.Mock(readCPUTopology).To(func(context.Context, fs.FS) (cpuTopology, error) {
+				calls++
+				return tt.topology, tt.err
+			}).Build()
+
+			info := GetMachineCPUInfo()
+			require.NotNil(t, info)
+			assert.Equal(t, int64(128), info.LogicalCores)
+			assert.Equal(t, tt.topology.cpusPerCore, info.CPUsPerCore)
+			assert.Equal(t, tt.topology.numCores, info.NumCores)
+			assert.Equal(t, tt.topology.numSockets, info.NumSockets)
+			assert.Equal(t, tt.wantCalls, calls)
+		})
+	}
+}
+
 // TestGetMachineMemoryInfo_WithMockedMemory tests GetMachineMemoryInfo with mocked memory functions
 func TestGetMachineMemoryInfo_WithMockedMemory(t *testing.T) {
 	mockey.PatchConvey("GetMachineMemoryInfo with mocked memory success", t, func() {
@@ -279,7 +342,6 @@ func TestGetProvider_WithMockedProviderDetection(t *testing.T) {
 		provider := GetProvider("8.8.8.8")
 		require.NotNil(t, provider)
 		assert.Equal(t, "gcp", provider.Provider)
-		assert.Equal(t, "8.8.8.8", provider.PublicIP)
 	})
 
 	mockey.PatchConvey("GetProvider with nil provider info returns unknown", t, func() {
@@ -294,7 +356,6 @@ func TestGetProvider_WithMockedProviderDetection(t *testing.T) {
 		provider := GetProvider("192.168.1.1")
 		require.NotNil(t, provider)
 		assert.Equal(t, "unknown", provider.Provider)
-		assert.Equal(t, "192.168.1.1", provider.PublicIP)
 	})
 
 	mockey.PatchConvey("GetProvider with empty public IP", t, func() {
@@ -516,7 +577,8 @@ func TestGetSystemResourceGPUCount_WithMockedNVML(t *testing.T) {
 // TestGetSystemResourceRootVolumeTotal_WithMockedDisk tests GetSystemResourceRootVolumeTotal
 func TestGetSystemResourceRootVolumeTotal_WithMockedDisk(t *testing.T) {
 	mockey.PatchConvey("GetSystemResourceRootVolumeTotal success", t, func() {
-		mockey.Mock(disk.GetUsage).To(func(ctx context.Context, path string) (*disk.Usage, error) {
+		mockey.Mock(currentGOOS).Return("linux").Build()
+		mockey.Mock(disk.GetUsageWithCommand).To(func(ctx context.Context, path, command string) (*disk.Usage, error) {
 			return &disk.Usage{
 				TotalBytes: 500 * 1024 * 1024 * 1024, // 500GB
 				FreeBytes:  200 * 1024 * 1024 * 1024,
@@ -526,13 +588,14 @@ func TestGetSystemResourceRootVolumeTotal_WithMockedDisk(t *testing.T) {
 
 		volume, err := GetSystemResourceRootVolumeTotal()
 		require.NoError(t, err)
-		assert.NotEmpty(t, volume)
+		assert.Equal(t, "536870912k", volume)
 		// The value should be parseable and non-zero
 		// DecimalSI format may use different suffixes (k, M, G, etc.)
 	})
 
 	mockey.PatchConvey("GetSystemResourceRootVolumeTotal error", t, func() {
-		mockey.Mock(disk.GetUsage).To(func(ctx context.Context, path string) (*disk.Usage, error) {
+		mockey.Mock(currentGOOS).Return("linux").Build()
+		mockey.Mock(disk.GetUsageWithCommand).To(func(ctx context.Context, path, command string) (*disk.Usage, error) {
 			return nil, errors.New("disk not accessible")
 		}).Build()
 
@@ -542,10 +605,20 @@ func TestGetSystemResourceRootVolumeTotal_WithMockedDisk(t *testing.T) {
 		assert.Contains(t, err.Error(), "failed to get disk usage")
 	})
 
+	mockey.PatchConvey("non-Linux root capacity retains native collection", t, func() {
+		mockey.Mock(currentGOOS).Return("darwin").Build()
+		mockey.Mock(disk.GetUsage).Return(&disk.Usage{TotalBytes: 1000}, nil).Build()
+		volume, err := GetSystemResourceRootVolumeTotal()
+		require.NoError(t, err)
+		assert.Equal(t, "1k", volume)
+	})
+
 	mockey.PatchConvey("GetSystemResourceRootVolumeTotal host df error", t, func() {
 		SetDiskCommands("", "", "host-df")
 		defer SetDiskCommands("", "", "")
-		mockey.Mock(disk.GetPartitions).To(func(ctx context.Context, opts ...disk.OpOption) (disk.Partitions, error) {
+		mockey.Mock(disk.GetUsageWithCommand).To(func(ctx context.Context, target, command string) (*disk.Usage, error) {
+			assert.Equal(t, "/", target)
+			assert.Equal(t, "host-df", command)
 			return nil, errors.New("host df failed")
 		}).Build()
 
@@ -553,32 +626,6 @@ func TestGetSystemResourceRootVolumeTotal_WithMockedDisk(t *testing.T) {
 		require.Error(t, err)
 		assert.Empty(t, volume)
 		assert.Contains(t, err.Error(), "host df failed")
-	})
-
-	mockey.PatchConvey("GetSystemResourceRootVolumeTotal host root missing", t, func() {
-		SetDiskCommands("", "", "host-df")
-		defer SetDiskCommands("", "", "")
-		mockey.Mock(disk.GetPartitions).To(func(ctx context.Context, opts ...disk.OpOption) (disk.Partitions, error) {
-			return nil, nil
-		}).Build()
-
-		volume, err := GetSystemResourceRootVolumeTotal()
-		require.Error(t, err)
-		assert.Empty(t, volume)
-		assert.Contains(t, err.Error(), "root partition not found")
-	})
-
-	mockey.PatchConvey("GetSystemResourceRootVolumeTotal host root usage missing", t, func() {
-		SetDiskCommands("", "", "host-df")
-		defer SetDiskCommands("", "", "")
-		mockey.Mock(disk.GetPartitions).To(func(ctx context.Context, opts ...disk.OpOption) (disk.Partitions, error) {
-			return disk.Partitions{{MountPoint: "/"}}, nil
-		}).Build()
-
-		volume, err := GetSystemResourceRootVolumeTotal()
-		require.Error(t, err)
-		assert.Empty(t, volume)
-		assert.Contains(t, err.Error(), "root partition not found")
 	})
 }
 
@@ -647,6 +694,43 @@ func TestGetMachineNICInfo_LeptonAndENIIncluded_WithMockey(t *testing.T) {
 	})
 }
 
+func TestGetMachineNICInfo_SkipsCiliumOverlay_WithMockey(t *testing.T) {
+	mockey.PatchConvey("GetMachineNICInfo drops Cilium and BlueField rshim links on bare-metal hosts", t, func() {
+		mockey.Mock(net.Interfaces).To(func() ([]net.Interface, error) {
+			return []net.Interface{
+				{Name: "bond0", Flags: net.FlagUp},
+				{Name: "cilium_host", Flags: net.FlagUp},
+				{Name: "cilium_net", Flags: net.FlagUp},
+				{Name: "cilium_vxlan", Flags: net.FlagUp},
+				{Name: "lxc_health", Flags: net.FlagUp},
+				{Name: "lxc8d3f1a2b", Flags: net.FlagUp},
+				{Name: "tmfifo_net0", Flags: net.FlagUp},
+			}, nil
+		}).Build()
+
+		mockey.Mock((*net.Interface).Addrs).To(func(ifi *net.Interface) ([]net.Addr, error) {
+			switch ifi.Name {
+			case "bond0":
+				// non-RFC1918 host IP: only the link-local IPv6 is recorded
+				return []net.Addr{
+					&net.IPNet{IP: net.ParseIP("7.251.157.169"), Mask: net.CIDRMask(24, 32)},
+					&net.IPNet{IP: net.ParseIP("fe80::1"), Mask: net.CIDRMask(64, 128)},
+				}, nil
+			case "tmfifo_net0":
+				return []net.Addr{&net.IPNet{IP: net.ParseIP("192.168.100.2"), Mask: net.CIDRMask(30, 32)}}, nil
+			default:
+				return []net.Addr{&net.IPNet{IP: net.ParseIP("10.128.154.123"), Mask: net.CIDRMask(32, 32)}}, nil
+			}
+		}).Build()
+
+		nicInfo := GetMachineNICInfo()
+		require.NotNil(t, nicInfo)
+		require.Len(t, nicInfo.PrivateIPInterfaces, 1)
+		assert.Equal(t, "bond0", nicInfo.PrivateIPInterfaces[0].Interface)
+		assert.Equal(t, "fe80::1", nicInfo.PrivateIPInterfaces[0].IP)
+	})
+}
+
 // TestGetMachineGPUInfo_WithNoDevices tests GetMachineGPUInfo with no devices
 func TestGetMachineGPUInfo_WithNoDevices(t *testing.T) {
 	mockey.PatchConvey("GetMachineGPUInfo with no devices", t, func() {
@@ -701,6 +785,8 @@ func TestGetProvider_NebiusSpecialCase(t *testing.T) {
 	})
 
 	mockey.PatchConvey("GetProvider with Nebius from ASN keeps empty instance ID on lookup error", t, func() {
+		setInstanceIDFallbackPaths(t, nil)
+
 		mockey.Mock(pkgprovidersall.Detect).To(func(ctx context.Context) (*providers.Info, error) {
 			return &providers.Info{
 				Provider: "",
@@ -732,6 +818,349 @@ func TestGetProvider_NebiusSpecialCase(t *testing.T) {
 		assert.Equal(t, "nebius", provider.Provider)
 		assert.Empty(t, provider.InstanceID)
 	})
+}
+
+func TestGetProvider_NscaleASNFallback(t *testing.T) {
+	mockey.PatchConvey("GetProvider with nscale from ASN queries nscale IMDS for instance ID, region, VM env, and private IP", t, func() {
+		setInstanceIDFallbackPaths(t, []string{writeInstanceIDFile(t, "d54e980a-3f27-46c2-bb18-bb10100dc730\n")})
+
+		mockey.Mock(pkgprovidersall.Detect).To(func(ctx context.Context) (*providers.Info, error) {
+			return &providers.Info{Provider: "unknown"}, nil
+		}).Build()
+		mockey.Mock(asn.GetASLookup).To(func(ip string) (*asn.ASLookupResponse, error) {
+			return &asn.ASLookupResponse{
+				Asn:     "212529",
+				AsnName: "nscale-stav-public",
+				Country: "is",
+				IP:      ip,
+			}, nil
+		}).Build()
+		mockey.Mock(nscale.GetInstanceID).To(func(context.Context) (string, error) {
+			return "i-00014a3a", nil
+		}).Build()
+		mockey.Mock(nscale.Region).To(func(context.Context) (string, error) {
+			return "eu-west-2", nil
+		}).Build()
+		mockey.Mock(nscale.VMEnvironment).To(func(context.Context) (string, error) {
+			return "nova", nil
+		}).Build()
+		mockey.Mock(nscale.PrivateIPv4).To(func(context.Context) (string, error) {
+			return "7.247.35.91", nil
+		}).Build()
+
+		provider := GetProvider("46.148.114.35")
+		require.NotNil(t, provider)
+		assert.Equal(t, "nscale", provider.Provider)
+		assert.True(t, provider.IMDSDetected)
+		assert.Equal(t, "i-00014a3a", provider.InstanceID)
+		assert.Equal(t, "eu-west-2", provider.Region)
+		assert.Equal(t, "nova", provider.VMEnvironment)
+		assert.Equal(t, "7.247.35.91", provider.PrivateIP)
+	})
+
+	mockey.PatchConvey("getProviderForLogin with nscale from ASN preserves explicit region override", t, func() {
+		setInstanceIDFallbackPaths(t, []string{writeInstanceIDFile(t, "d54e980a-3f27-46c2-bb18-bb10100dc730\n")})
+
+		mockey.Mock(pkgprovidersall.DetectWithOverrides).To(func(ctx context.Context, regionOverride, instanceIDOverride string) (*providers.Info, error) {
+			return &providers.Info{Provider: "unknown", Region: regionOverride, InstanceID: instanceIDOverride}, nil
+		}).Build()
+		mockey.Mock(asn.GetASLookup).To(func(ip string) (*asn.ASLookupResponse, error) {
+			return &asn.ASLookupResponse{
+				Asn:     "212529",
+				AsnName: "nscale",
+				Country: "is",
+				IP:      ip,
+			}, nil
+		}).Build()
+		mockey.Mock(nscale.GetInstanceID).To(func(context.Context) (string, error) {
+			return "i-00014a3a", nil
+		}).Build()
+		regionCalled := false
+		mockey.Mock(nscale.Region).To(func(context.Context) (string, error) {
+			regionCalled = true
+			return "other-region", nil
+		}).Build()
+		mockey.Mock(nscale.VMEnvironment).To(func(context.Context) (string, error) {
+			return "nova", nil
+		}).Build()
+		mockey.Mock(nscale.PrivateIPv4).To(func(context.Context) (string, error) {
+			return "7.247.35.91", nil
+		}).Build()
+
+		provider := getProviderForLogin("46.148.114.35", "eu-north-1", "")
+		require.NotNil(t, provider)
+		assert.Equal(t, "nscale", provider.Provider)
+		assert.True(t, provider.IMDSDetected)
+		assert.Equal(t, "i-00014a3a", provider.InstanceID)
+		assert.Equal(t, "eu-north-1", provider.Region)
+		assert.False(t, regionCalled, "explicit region override must not be overwritten by nscale.Region")
+	})
+
+	mockey.PatchConvey("GetProvider with nscale from ASN does not fall back to cloud-init UUID when IMDS instance ID fails", t, func() {
+		setInstanceIDFallbackPaths(t, []string{writeInstanceIDFile(t, "d54e980a-3f27-46c2-bb18-bb10100dc730\n")})
+
+		mockey.Mock(pkgprovidersall.Detect).To(func(ctx context.Context) (*providers.Info, error) {
+			return &providers.Info{Provider: "unknown"}, nil
+		}).Build()
+		mockey.Mock(pkgprovidersall.DetectWithOverrides).To(func(ctx context.Context, regionOverride, instanceIDOverride string) (*providers.Info, error) {
+			return &providers.Info{Provider: "unknown", Region: regionOverride, InstanceID: instanceIDOverride}, nil
+		}).Build()
+		mockey.Mock(asn.GetASLookup).To(func(ip string) (*asn.ASLookupResponse, error) {
+			return &asn.ASLookupResponse{
+				Asn:     "212529",
+				AsnName: "nscale",
+				Country: "is",
+				IP:      ip,
+			}, nil
+		}).Build()
+		mockey.Mock(nscale.GetInstanceID).To(func(context.Context) (string, error) {
+			return "", errors.New("imds 503")
+		}).Build()
+		mockey.Mock(nscale.Region).To(func(context.Context) (string, error) {
+			return "", errors.New("imds 503")
+		}).Build()
+		mockey.Mock(nscale.VMEnvironment).To(func(context.Context) (string, error) {
+			return "", errors.New("imds 503")
+		}).Build()
+		mockey.Mock(nscale.PrivateIPv4).To(func(context.Context) (string, error) {
+			return "", errors.New("imds 503")
+		}).Build()
+
+		provider := GetProvider("46.148.114.35")
+		require.NotNil(t, provider)
+		assert.Equal(t, "nscale", provider.Provider)
+		assert.True(t, provider.IMDSDetected, "IMDSDetected must be true so login fails fast instead of registering without instance ID")
+		assert.Empty(t, provider.InstanceID, "must not read OpenStack config-drive UUID from /var/lib/cloud/data/instance-id")
+
+		req, err := createLoginRequest(
+			"token", "machine-id", "node-group", "0", &mockNvmlInstance{},
+			func() (string, error) { return "46.148.114.35", nil },
+			func() *apiv1.MachineLocation { return &apiv1.MachineLocation{Region: "eu-west-2"} },
+			func(nvidianvml.Instance) (*apiv1.MachineInfo, error) { return nil, nil },
+			func(ip string) *providers.Info { return getProviderForLogin(ip, "", "") },
+			func() (string, error) { return "100Gi", nil },
+			func(nvidianvml.Instance) (string, error) { return "0", nil },
+			noDefaultRouteHostIPv4,
+		)
+		require.ErrorContains(t, err, `provider "nscale" IMDS did not return an instance ID after retries; aborting login`)
+		assert.Nil(t, req)
+	})
+}
+
+func setInstanceIDFallbackPaths(t *testing.T, paths []string) {
+	t.Helper()
+	orig := instanceIDFallbackPaths
+	instanceIDFallbackPaths = paths
+	t.Cleanup(func() { instanceIDFallbackPaths = orig })
+}
+
+func writeInstanceIDFile(t *testing.T, content string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "instance-id")
+	require.NoError(t, os.WriteFile(p, []byte(content), 0o600))
+	return p
+}
+
+// TestGetProvider_InstanceIDFileFallback covers hosts with no metadata service
+// (Mistral bare metal, Lambda, Linode): the instance ID comes from the cloud-init file.
+func TestGetProvider_InstanceIDFileFallback(t *testing.T) {
+	tests := []struct {
+		name     string
+		asnName  string
+		file     string
+		fallback string
+		wantName string
+		wantID   string
+	}{
+		{name: "mistral keeps metal3 uuid", asnName: "mistral-compute - mistral compute holding sas", file: "2b1434ed-d9fc-489f-9fd4-7859292d309f\n", wantName: "mistral", wantID: "2b1434ed-d9fc-489f-9fd4-7859292d309f"},
+		{name: "lambda uses api hex form", asnName: "lambda - lambda", file: "ebfd7e9b-fa1b-4d27-9603-58ffd1a2571a\n", wantName: "lambda", wantID: "ebfd7e9bfa1b4d27960358ffd1a2571a"},
+		{name: "linode uses decimal id", asnName: "linode - akamai connected cloud", file: "108254612\n", wantName: "linode - akamai connected cloud", wantID: "108254612"},
+		{name: "second linode decimal id", asnName: "linode - akamai connected cloud", file: " \t108254616\r\n", wantName: "linode - akamai connected cloud", wantID: "108254616"},
+		{name: "opaque id preserves case", asnName: "linode - akamai connected cloud", file: " \tVendor-Node-A1\r\n", wantName: "linode - akamai connected cloud", wantID: "Vendor-Node-A1"},
+		{name: "firebird bm ulid", asnName: "firebird-as-51693 - supercom llc", file: "bm.01M3KNHF1NFX3VX8Z1EWNQ2H3X\n", wantName: "firebird-as-51693 - supercom llc", wantID: "bm.01M3KNHF1NFX3VX8Z1EWNQ2H3X"},
+		{name: "unknown provider still gets the id", asnName: "firebird-as-51693 - supercom llc", file: "4c4c4544-0032-5010-8057-b3c04f504b34", wantName: "firebird-as-51693 - supercom llc", wantID: "4c4c4544-0032-5010-8057-b3c04f504b34"},
+		{name: "no datasource placeholder is ignored", asnName: "mistral-compute - mistral compute holding sas", file: " \tiid-datasource-none\r\n", wantName: "mistral"},
+		{name: "datasource placeholder is ignored", asnName: "mistral-compute - mistral compute holding sas", file: " \tiid-datasource\r\n", wantName: "mistral"},
+		{name: "nocloud placeholder is ignored", asnName: "mistral-compute - mistral compute holding sas", file: " \tnocloud\r\n", wantName: "mistral"},
+		{name: "config drive placeholder is ignored", asnName: "mistral-compute - mistral compute holding sas", file: " \tiid-dsconfigdrive\r\n", wantName: "mistral"},
+		{name: "ovf placeholder is ignored", asnName: "mistral-compute - mistral compute holding sas", file: " \tiid-dsovf\r\n", wantName: "mistral"},
+		{name: "opennebula placeholder is ignored", asnName: "mistral-compute - mistral compute holding sas", file: " \tiid-dsopennebula\r\n", wantName: "mistral"},
+		{name: "placeholder does not hide valid fallback", asnName: "linode - akamai connected cloud", file: " \tnocloud\r\n", fallback: "108254616\n", wantName: "linode - akamai connected cloud", wantID: "108254616"},
+	}
+	for _, tt := range tests {
+		mockey.PatchConvey(tt.name, t, func() {
+			paths := []string{filepath.Join(t.TempDir(), "missing"), writeInstanceIDFile(t, tt.file)}
+			if tt.fallback != "" {
+				paths = append(paths, writeInstanceIDFile(t, tt.fallback))
+			}
+			setInstanceIDFallbackPaths(t, paths)
+			mockey.Mock(pkgprovidersall.Detect).To(func(ctx context.Context) (*providers.Info, error) {
+				return &providers.Info{Provider: ""}, nil
+			}).Build()
+			mockey.Mock(asn.GetASLookup).To(func(ip string) (*asn.ASLookupResponse, error) {
+				return &asn.ASLookupResponse{AsnName: tt.asnName, IP: ip}, nil
+			}).Build()
+
+			provider := GetProviderWithContext(context.Background(), "1.2.3.4")
+			require.NotNil(t, provider)
+			assert.Equal(t, tt.wantName, provider.Provider)
+			assert.Equal(t, tt.wantID, provider.InstanceID)
+		})
+	}
+
+	mockey.PatchConvey("metadata instance ID is not overridden by the file", t, func() {
+		setInstanceIDFallbackPaths(t, []string{writeInstanceIDFile(t, "2b1434ed-d9fc-489f-9fd4-7859292d309f")})
+		mockey.Mock(pkgprovidersall.Detect).To(func(ctx context.Context) (*providers.Info, error) {
+			return &providers.Info{Provider: "aws", InstanceID: "i-0abc123", IMDSDetected: true}, nil
+		}).Build()
+
+		provider := GetProvider("1.2.3.4")
+		require.NotNil(t, provider)
+		assert.Equal(t, "i-0abc123", provider.InstanceID)
+	})
+}
+
+func TestGetProvider_InstanceIDFileFallbackWithoutASN(t *testing.T) {
+	const instanceID = "2b1434ed-d9fc-489f-9fd4-7859292d309f"
+	tests := []struct {
+		name         string
+		publicIP     string
+		file         string
+		detectionErr error
+		wantID       string
+	}{
+		{name: "ASN failure keeps local UUID", publicIP: "1.2.3.4", file: instanceID, wantID: instanceID},
+		{name: "ASN failure keeps Firebird ID", publicIP: "1.2.3.4", file: "bm.01M3KNHF1NFX3VX8Z1EWNQ2H3X", wantID: "bm.01M3KNHF1NFX3VX8Z1EWNQ2H3X"},
+		{name: "detection and ASN failure keep local ID", publicIP: "1.2.3.4", file: instanceID, detectionErr: errors.New("detection failed"), wantID: instanceID},
+		{name: "no public IP keeps local ID", file: instanceID, wantID: instanceID},
+		{name: "ASN failure ignores placeholder", publicIP: "1.2.3.4", file: "iid-datasource-none"},
+		{name: "ASN failure tolerates missing file", publicIP: "1.2.3.4"},
+	}
+	for _, tt := range tests {
+		mockey.PatchConvey(tt.name, t, func() {
+			paths := []string{filepath.Join(t.TempDir(), "missing")}
+			if tt.file != "" {
+				paths = append(paths, writeInstanceIDFile(t, tt.file))
+			}
+			setInstanceIDFallbackPaths(t, paths)
+			mockey.Mock(asn.GetASLookup).To(func(ip string) (*asn.ASLookupResponse, error) {
+				require.NotEmpty(t, tt.publicIP, "ASN lookup needs a public IP")
+				return nil, errors.New("ASN lookup unavailable")
+			}).Build()
+
+			provider := getProviderWithContext(context.Background(), tt.publicIP, "", func(context.Context) (*providers.Info, error) {
+				if tt.detectionErr != nil {
+					return nil, tt.detectionErr
+				}
+				return &providers.Info{Provider: "unknown"}, nil
+			})
+			require.NotNil(t, provider)
+			assert.Equal(t, "unknown", provider.Provider)
+			assert.Equal(t, tt.wantID, provider.InstanceID)
+		})
+	}
+}
+
+func TestGetProvider_ReadsInstanceIDFileBeforeDetection(t *testing.T) {
+	mockey.PatchConvey("network discovery cannot hide an already readable local ID", t, func() {
+		const instanceID = "2b1434ed-d9fc-489f-9fd4-7859292d309f"
+		path := writeInstanceIDFile(t, instanceID)
+		setInstanceIDFallbackPaths(t, []string{path})
+		mockey.Mock(asn.GetASLookup).To(func(string) (*asn.ASLookupResponse, error) {
+			return &asn.ASLookupResponse{AsnName: "mistral"}, nil
+		}).Build()
+
+		provider := getProviderWithContext(context.Background(), "1.2.3.4", "", func(context.Context) (*providers.Info, error) {
+			require.NoError(t, os.Remove(path))
+			return &providers.Info{Provider: "unknown"}, nil
+		})
+		require.NotNil(t, provider)
+		assert.Equal(t, "mistral", provider.Provider)
+		assert.Equal(t, instanceID, provider.InstanceID)
+	})
+}
+
+func TestLoginInstanceIDOverrideDoesNotChangeRuntimeDiscovery(t *testing.T) {
+	for _, providerName := range []string{"nvidia-net", "lambda", "nebius", "nscale"} {
+		mockey.PatchConvey(providerName, t, func() {
+			previousDetectors := pkgprovidersall.All
+			pkgprovidersall.All = nil
+			defer func() { pkgprovidersall.All = previousDetectors }()
+			mockey.Mock(asn.GetASLookup).To(func(ip string) (*asn.ASLookupResponse, error) {
+				return &asn.ASLookupResponse{AsnName: providerName, IP: ip}, nil
+			}).Build()
+			identityReads := 0
+			readIdentity := func(context.Context) (string, error) {
+				identityReads++
+				return "discoveredID", nil
+			}
+			mockey.Mock(nebius.GetInstanceID).To(readIdentity).Build()
+			mockey.Mock(nscale.GetInstanceID).To(readIdentity).Build()
+			hostIdentityReads := 0
+			mockey.Mock(readInstanceIDFallback).To(func([]string) string {
+				hostIdentityReads++
+				return "discoveredID"
+			}).Build()
+			mockey.Mock(nscale.Region).To(func(context.Context) (string, error) { return "eu-west-2", nil }).Build()
+			mockey.Mock(nscale.PrivateIPv4).To(func(context.Context) (string, error) { return "10.0.0.2", nil }).Build()
+			mockey.Mock(nscale.VMEnvironment).To(func(context.Context) (string, error) { return "nova", nil }).Build()
+
+			// An opaque, case-sensitive ID must not be parsed as a cloud-init UUID
+			// or normalized to Lambda's 32-hex representation.
+			provider := getProviderForLogin("1.2.3.4", "eu-north-1", "IPP-Node-A1")
+			require.Equal(t, "IPP-Node-A1", provider.InstanceID)
+			require.Equal(t, "eu-north-1", provider.Region)
+			require.Zero(t, identityReads, "an explicit ID must skip provider and host-file identity discovery")
+			require.Zero(t, hostIdentityReads, "an explicit ID must skip host-file identity discovery")
+
+			runtimeProvider := GetProvider("1.2.3.4")
+			require.Equal(t, "discoveredID", runtimeProvider.InstanceID)
+			require.Equal(t, 1, hostIdentityReads, "runtime discovery must read a local candidate before network lookup")
+			if providerName == "nebius" || providerName == "nscale" {
+				require.Equal(t, 1, identityReads, "the login override must not affect subsequent provider identity discovery")
+			} else {
+				require.Zero(t, identityReads)
+			}
+		})
+	}
+}
+
+func TestCreateLoginRequestInstanceIDOverrideKeepsRegionValidation(t *testing.T) {
+	for _, region := range []string{"", "unknown", "eu-west-2"} {
+		mockey.PatchConvey("region="+region, t, func() {
+			previousDetectors := pkgprovidersall.All
+			pkgprovidersall.All = []providers.Detector{providers.NewIMDSWithRegion(
+				"aws",
+				func(context.Context) (string, error) { return "aws", nil },
+				func(context.Context) (string, error) { return "1.2.3.4", nil },
+				func(context.Context) (string, error) { return "10.0.0.2", nil },
+				func(context.Context) (string, error) { return region, nil },
+				nil,
+				func(context.Context) (string, error) { panic("instance-ID discovery must be skipped") },
+			)}
+			defer func() { pkgprovidersall.All = previousDetectors }()
+			mockey.Mock(netutil.PublicIP).To(func() (string, error) { return "1.2.3.4", nil }).Build()
+			mockey.Mock(GetMachineInfo).To(func(nvidianvml.Instance) (*apiv1.MachineInfo, error) {
+				return &apiv1.MachineInfo{
+					CPUInfo:    &apiv1.MachineCPUInfo{LogicalCores: 8},
+					MemoryInfo: &apiv1.MachineMemoryInfo{TotalBytes: 1024},
+				}, nil
+			}).Build()
+			mockey.Mock(GetSystemResourceRootVolumeTotal).To(func() (string, error) { return "100Gi", nil }).Build()
+
+			req, err := CreateLoginRequestWithOverrides("token", "machine-id", "", "0", "", "IPP-Node-A1", &mockNvmlInstance{})
+			if region != "eu-west-2" {
+				require.ErrorContains(t, err, "IMDS did not return a region")
+				require.Nil(t, req)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, "IPP-Node-A1", req.ProviderInstanceID)
+			require.Equal(t, "machine-id", req.MachineID)
+			require.Equal(t, "eu-west-2", req.Location.Region)
+			require.Equal(t, "10.0.0.2", req.Network.PrivateIP)
+		})
+	}
 }
 
 // TestGetMachineDiskInfo_WithMockedDisk tests GetMachineDiskInfo on Linux

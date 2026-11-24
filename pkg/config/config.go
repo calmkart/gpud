@@ -87,6 +87,11 @@ type Config struct {
 	// runs against the host's service manager; exit code 0 means active.
 	ContainerdServiceActiveCommands string `json:"containerd_service_active_commands,omitempty"`
 
+	// ContainerdDanglingPodGracePeriod delays counting API-absent READY sandboxes. Zero counts immediately.
+	ContainerdDanglingPodGracePeriod metav1.Duration `json:"containerd_dangling_pod_grace_period,omitempty"`
+
+	Containerd pkgconfigcommon.ContainerdConfig `json:"containerd,omitempty"`
+
 	// VersionFile is the file that contains the target version.
 	// If empty, the version file is not used.
 	VersionFile string `json:"version_file"`
@@ -97,12 +102,28 @@ type Config struct {
 	// PluginSpecsFile is the file that contains the plugin specs.
 	PluginSpecsFile string `json:"plugin_specs_file"`
 
+	// PluginSpecsFileManaged keeps the control-plane session reachable when a
+	// persisted profile cannot load or an init plugin fails.
+	PluginSpecsFileManaged bool `json:"plugin_specs_file_managed,omitempty"`
+
+	// NVSentinel configures the optional NVSentinel integration.
+	// When enabled, GPUd serves the NVSentinel PlatformConnector gRPC API on
+	// a local unix socket. The node's NVSentinel platform-connector forwards
+	// health events to that socket. Components prefer the NVSentinel data
+	// point when one exists and fall back to their own detection otherwise.
+	NVSentinel *NVSentinelConfig `json:"nvsentinel,omitempty"`
+
 	// Components specifies the components to enable.
 	// Leave empty, "*", or "all" to enable all components.
 	// Or prefix component names with "-" to disable them.
 	Components         []string       `json:"components"`
 	selectedComponents map[string]any `json:"-"`
 	disabledComponents map[string]any `json:"-"`
+	// allComponentsSelected is true when Components contains "*" or "all".
+	allComponentsSelected bool `json:"-"`
+	// hasComponentAllowlist is true when Components contains at least one
+	// positive (non-"-") entry other than "*" / "all".
+	hasComponentAllowlist bool `json:"-"`
 
 	// FailureInjector is the failure injector.
 	FailureInjector *components.FailureInjector `json:"failure_injector,omitempty"`
@@ -139,7 +160,32 @@ type Config struct {
 	SessionEndpoint string `json:"-"`
 }
 
+// NVSentinelConfig holds the top-level NVSentinel endpoint settings.
+type NVSentinelConfig struct {
+	// Enabled turns the NVSentinel receiver on. Default false.
+	Enabled bool `json:"enabled"`
+
+	// SocketPath is the unix socket GPUd serves for NVSentinel health event
+	// forwarding. The NVSentinel platform-connector container must reach this
+	// path. The default works with the stock NVSentinel DaemonSet, which
+	// mounts the host /var/run/nvsentinel directory at container /var/run.
+	// Empty means nvsentinel.DefaultSocketPath.
+	SocketPath string `json:"socket_path,omitempty"`
+
+	// EventDedupWindow is how long a received NVSentinel event suppresses
+	// GPUd's own duplicate detection of the same data point. It needs only
+	// to cover the delivery skew between the two detectors that watch the
+	// same incident. Zero means nvsentinel.DefaultEventDedupWindow.
+	EventDedupWindow metav1.Duration `json:"event_dedup_window,omitempty"`
+}
+
 func (config *Config) Validate() error {
+	if config.ContainerdDanglingPodGracePeriod.Duration < 0 {
+		return errors.New("containerd_dangling_pod_grace_period must not be negative")
+	}
+	if err := config.Containerd.Validate(); err != nil {
+		return err
+	}
 	if config.Address == "" {
 		return errors.New("address is required")
 	}
@@ -152,6 +198,14 @@ func (config *Config) Validate() error {
 	if config.NFSHostRoot != "" && !filepath.IsAbs(config.NFSHostRoot) {
 		return fmt.Errorf("nfs_host_root must be an absolute path, got %q", config.NFSHostRoot)
 	}
+	if config.NVSentinel != nil {
+		if config.NVSentinel.SocketPath != "" && !filepath.IsAbs(config.NVSentinel.SocketPath) {
+			return fmt.Errorf("nvsentinel.socket_path must be an absolute path, got %q", config.NVSentinel.SocketPath)
+		}
+		if d := config.NVSentinel.EventDedupWindow.Duration; d < 0 {
+			return fmt.Errorf("nvsentinel.event_dedup_window must not be negative, got %s", d)
+		}
+	}
 	switch config.SessionProtocol {
 	case "", "v1", "v2", "auto":
 	default:
@@ -161,61 +215,96 @@ func (config *Config) Validate() error {
 	return nil
 }
 
+// parseComponentSelectors lazily builds the allowlist and denylist lookup
+// maps from Config.Components. Entries prefixed with "-" form the denylist,
+// stored under their bare component names because callers (e.g. pkg/server)
+// look components up by bare name. All other entries form the allowlist,
+// where "*" and "all" select every component. A list containing only
+// "-"-prefixed entries enables every component except the denylisted ones.
+//
+// Why stored bare (LEP-6439): the only production caller,
+// pkg/server/server.go, invokes ShouldDisable(name) with the bare registered
+// component name (e.g. "library"). The previous implementation stored the key
+// as "-library" -- prefix included -- so the lookup could never match and the
+// entire disable path was dead code. The old unit tests masked this by
+// querying ShouldDisable("-comp1") with the prefix still attached, i.e. not
+// mirroring the production call. Bug found in production on containerized
+// AWS BYOK clusters, where there was no working way to silence
+// individual noisy components.
+func (config *Config) parseComponentSelectors() {
+	if config.selectedComponents != nil {
+		return
+	}
+	config.selectedComponents = make(map[string]any)
+	config.disabledComponents = make(map[string]any)
+	for _, c := range config.Components {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+		if name, ok := strings.CutPrefix(c, "-"); ok {
+			config.disabledComponents[strings.TrimSpace(name)] = struct{}{}
+			continue
+		}
+		if c == "*" || c == "all" {
+			config.allComponentsSelected = true
+			continue
+		}
+		config.hasComponentAllowlist = true
+		config.selectedComponents[c] = struct{}{}
+	}
+}
+
 // ShouldEnable returns true if the component should be enabled.
-// If the enable component sets are not specified, it will return true,
-// meaning it should be enabled by default.
+// If the component list is not specified, it returns true, meaning every
+// component is enabled by default. A list containing only "-"-prefixed
+// entries enables every component except the denylisted ones. Otherwise the
+// positive entries form an allowlist ("*" and "all" select every component),
+// and "-"-prefixed entries subtract from the result in both modes.
 func (config *Config) ShouldEnable(componentName string) bool {
 	// not specified, thus enable all components
-	if len(config.Components) == 0 || config.Components[0] == "*" || config.Components[0] == "all" {
+	if len(config.Components) == 0 {
 		return true
 	}
 
-	if config.selectedComponents == nil {
-		config.selectedComponents = make(map[string]any)
+	config.parseComponentSelectors()
 
-		for _, c := range config.Components {
-			if c == "*" || c == "all" {
-				// enable all components
-				return true
-			}
-
-			// prefix "-" is used to disable a component
-			if strings.HasPrefix(c, "-") {
-				continue
-			}
-			config.selectedComponents[c] = struct{}{}
-		}
+	// the denylist wins in both allowlist and denylist-only modes:
+	// "--components=all,-foo" and "--components=-foo" both disable "foo".
+	// (LEP-6439: the old "all"/"*" early return bailed out before "-" entries
+	// were ever read, so "--components=all,-library" silently kept library
+	// enabled -- exactly the combination the aws-iad-nkxdev-1 BYOK hot-fix
+	// needed.)
+	if _, disabled := config.disabledComponents[componentName]; disabled {
+		return false
 	}
 
+	// "all"/"*", or a denylist-only list ("--components=-foo,-bar"):
+	// everything not denylisted stays enabled. (LEP-6439: previously a
+	// denylist-only list produced an EMPTY allowlist, so ShouldEnable returned
+	// false for every component and pkg/server registered zero components --
+	// the flag's own help text promises "-name" disables just that component.
+	// Note "none" is a positive, non-matching entry, so the documented
+	// "disable all components" escape hatch still works.)
+	if config.allComponentsSelected || !config.hasComponentAllowlist {
+		return true
+	}
+
+	// allowlist mode: only the listed components are enabled
 	_, shouldEnable := config.selectedComponents[componentName]
 	return shouldEnable
 }
 
 // ShouldDisable returns true if the component should be disabled.
-// If the disable component sets are not specified, it will return false,
-// meaning it should not be disabled, instead enabled by default.
+// If the component list is not specified, it returns false, meaning no
+// component is disabled by default.
 func (config *Config) ShouldDisable(componentName string) bool {
 	// not specified, thus enable all components (meaning should NOT disable any component)
-	if len(config.Components) == 0 || config.Components[0] == "*" || config.Components[0] == "all" {
+	if len(config.Components) == 0 {
 		return false
 	}
 
-	if config.disabledComponents == nil {
-		config.disabledComponents = make(map[string]any)
-
-		for _, c := range config.Components {
-			if c == "*" || c == "all" {
-				// enable all components
-				return false
-			}
-
-			// prefix "-" is used to disable a component
-			if !strings.HasPrefix(c, "-") {
-				continue
-			}
-			config.disabledComponents[c] = struct{}{}
-		}
-	}
+	config.parseComponentSelectors()
 
 	_, shouldDisable := config.disabledComponents[componentName]
 	return shouldDisable

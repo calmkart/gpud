@@ -16,7 +16,6 @@ func TestNewDefaultNoEnvVars(t *testing.T) {
 	require.NoError(t, os.Unsetenv(EnvInjectRemapedRowsPending))
 	require.NoError(t, os.Unsetenv(EnvInjectClockEventsHwSlowdown))
 	require.NoError(t, os.Unsetenv(EnvNVMLLibraryPath))
-	require.NoError(t, os.Unsetenv(EnvNVIDIADriverRoot))
 
 	// Create a new library instance
 	lib, err := New(WithInitReturn(nvml.SUCCESS))
@@ -50,8 +49,11 @@ func TestNewDefaultMockAllSuccess(t *testing.T) {
 
 	// Test that device functions are available and succeed
 	devices, err := lib.Device().GetDevices()
-	assert.NoError(t, err)
-	assert.NotEmpty(t, devices)
+	require.NoError(t, err)
+	require.NotEmpty(t, devices)
+	arch, ret := devices[0].GetArchitecture()
+	require.Equal(t, nvml.SUCCESS, ret)
+	require.Equal(t, nvml.DeviceArchitecture(nvml.DEVICE_ARCH_AMPERE), arch)
 }
 
 // TestNewDefaultMultipleEnvVars tests the NewDefault function when multiple environment variables are set
@@ -102,5 +104,4 @@ func cleanupEnvVars() {
 	_ = os.Unsetenv(EnvInjectRemapedRowsPending)
 	_ = os.Unsetenv(EnvInjectClockEventsHwSlowdown)
 	_ = os.Unsetenv(EnvNVMLLibraryPath)
-	_ = os.Unsetenv(EnvNVIDIADriverRoot)
 }

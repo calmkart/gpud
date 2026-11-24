@@ -87,8 +87,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -96,9 +101,12 @@ import (
 
 	apiv1 "github.com/leptonai/gpud/api/v1"
 	"github.com/leptonai/gpud/components"
+	"github.com/leptonai/gpud/components/accelerator/nvidia/fabric"
 	"github.com/leptonai/gpud/pkg/eventstore"
+	pkghost "github.com/leptonai/gpud/pkg/host"
 	"github.com/leptonai/gpud/pkg/log"
 	netutil "github.com/leptonai/gpud/pkg/netutil"
+	"github.com/leptonai/gpud/pkg/nvidia/driverroot"
 	nvidianvml "github.com/leptonai/gpud/pkg/nvidia/nvml"
 	"github.com/leptonai/gpud/pkg/nvidia/nvml/device"
 	nvidiapci "github.com/leptonai/gpud/pkg/nvidia/pci"
@@ -119,10 +127,14 @@ const (
 var _ components.Component = &component{}
 
 type component struct {
+	checkMu sync.Mutex
+
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	nvmlInstance nvidianvml.Instance
+	nvmlInstance       nvidianvml.Instance
+	fabricRegistration fabric.Registration
+	getTimeNowFunc     func() time.Time
 
 	getCountLspci func(ctx context.Context) (int, error)
 
@@ -131,6 +143,9 @@ type component struct {
 
 	checkFMExistsFunc func() bool
 	checkFMActiveFunc func() bool
+
+	// checkIMEXActiveFunc reports whether the nvidia-imex daemon is running.
+	checkIMEXActiveFunc func() bool
 
 	eventBucket      eventstore.Bucket
 	logLineProcessor *logLineProcessor
@@ -185,9 +200,15 @@ func New(gpudInstance *components.GPUdInstance) (components.Component, error) {
 
 		checkFMExistsFunc: checkFMExists,
 		checkFMActiveFunc: checkFMActive,
+		checkIMEXActiveFunc: func() bool {
+			// IMEX runs as a host systemd service on bare metal and as a
+			// ComputeDomain daemon pod under the NVIDIA DRA driver; scanning the
+			// host /proc (hostPID DaemonSet or bare metal) observes both.
+			return processRunning("/proc", "nvidia-imex")
+		},
 
 		// Enable testing mode when failure injection is configured (e.g., --gpu-product-name override).
-		// This allows testing fabric state injection on single-GPU systems.
+		// External rack fabrics also do not depend on the number of local GPUs.
 		testingMode: gpudInstance.FailureInjector != nil && gpudInstance.FailureInjector.GPUProductNameOverride != "",
 	}
 
@@ -209,6 +230,10 @@ func New(gpudInstance *components.GPUdInstance) (components.Component, error) {
 		c.logLineProcessor = newLogLineProcessor(cctx, w, Match, c.eventBucket)
 	}
 
+	if err := c.fabricRegistration.Open(c.ctx, gpudInstance.DBRW, Name, pkghost.BootID()); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
 	return c, nil
 }
 
@@ -278,10 +303,17 @@ func (c *component) Close() error {
 }
 
 func (c *component) Check() components.CheckResult {
+	// Keep collection timestamps, registration deadlines, and result publication ordered.
+	c.checkMu.Lock()
+	defer c.checkMu.Unlock()
+
 	log.Logger.Infow("checking nvidia fabric manager")
 
 	cr := &checkResult{
-		ts: time.Now().UTC(),
+		ts: time.Now(),
+	}
+	if c.getTimeNowFunc != nil {
+		cr.ts = c.getTimeNowFunc()
 	}
 	defer func() {
 		c.lastMu.Lock()
@@ -331,8 +363,8 @@ func (c *component) Check() components.CheckResult {
 	//      - FabricStateSupported() returns false because PCIe cards don't have NVSwitch fabric
 	//      - WORKAROUND: Use --gpu-product-name="NVIDIA H100 80GB HBM3" to simulate SXM variant
 	//
-	//   2. Non-Hopper/GB200 GPUs (A100, V100, etc.):
-	//      - FabricStateSupported() returns false; only H100-SXM, H200-SXM, GB200 are supported
+	//   2. Products without NVML fabric telemetry (A100, V100, etc.):
+	//      - FabricStateSupported() returns false; supported Hopper/Blackwell variants use NVML
 	//      - WORKAROUND: Use --gpu-product-name="NVIDIA H100 80GB HBM3" to simulate H100-SXM
 	//
 	//   3. Single-GPU systems (count < 2):
@@ -352,12 +384,19 @@ func (c *component) Check() components.CheckResult {
 	//   4. collectFabricState() detects the unhealthy state via GetIssues() (fabric_state.go)
 	//   5. This Check() method sets health=Unhealthy based on the report
 	//
+	caps := c.nvmlInstance.Capabilities()
+	// Match the effective family used by NVLink, including product overrides.
+	isRubin := caps.Rubin
+	nonPCIFabric := caps.NonPCIFabricCandidate
+	externalFabric := caps.ExternalFabricCandidate
+	fmRequired := c.nvmlInstance.FabricManagerSupported()
 	if c.nvmlInstance.FabricStateSupported() {
 		cr.FabricStateSupported = true
 
 		// Skip the GPU count check in testing mode (when --gpu-product-name is used).
-		// This allows testing fabric state injection on single-GPU systems.
-		if !c.testingMode && c.getCountLspci != nil {
+		// Rubin must also probe when C2C is unavailable: one visible GPU cannot
+		// rule out a rack partition, and NVML can still report its fabric faults.
+		if !c.testingMode && !externalFabric && !isRubin && c.getCountLspci != nil {
 			count, err := c.getCountLspci(c.ctx)
 			if err != nil {
 				log.Logger.Warnw("failed to count GPUs via lspci for fabric check", "error", err)
@@ -376,10 +415,11 @@ func (c *component) Check() components.CheckResult {
 		// Some GPU configurations (e.g., GH200 standalone, PCIe cards) support the fabric state
 		// API at the product level but don't have NVSwitch hardware. In these cases, the NVML
 		// fabric state API returns "Not Supported" which should not be treated as unhealthy.
-		// This check must happen BEFORE collectFabricState() to avoid false unhealthy reports.
+		// Blackwell switches behind CX7 and external rack switches are not PCIe devices
+		// on the host; those products must probe NVML before deciding applicability.
 		// Ref: https://www.nvidia.com/en-us/data-center/grace-hopper-superchip/
 		// Ref: https://docs.nvidia.com/datacenter/tesla/fabric-manager-user-guide/index.html
-		if !c.testingMode && c.checkNVSwitchExistsFunc != nil && !c.checkNVSwitchExistsFunc() {
+		if !c.testingMode && !nonPCIFabric && c.checkNVSwitchExistsFunc != nil && !c.checkNVSwitchExistsFunc() {
 			log.Logger.Infow("skipping fabric state check because NVSwitch not detected")
 			cr.health = apiv1.HealthStateTypeHealthy
 			cr.reason = c.nvmlInstance.ProductName() + ": NVSwitch not detected, skipping fabric state check"
@@ -389,8 +429,31 @@ func (c *component) Check() components.CheckResult {
 
 		report := c.collectFabricStateFunc()
 		cr.FabricStates = report.Entries
+
+		if report.AllUnsupported && !c.testingMode && c.checkNVSwitchExistsFunc != nil &&
+			fabric.Report(report).UnsupportedWithoutFabric(caps.ExplicitNVL72, c.checkNVSwitchExistsFunc()) {
+			cr.FabricStateSupported = false
+			cr.health = apiv1.HealthStateTypeHealthy
+			cr.reason = c.nvmlInstance.ProductName() + ": fabric telemetry unsupported and no NVSwitch detected; skipping fabric state check"
+			cr.FabricStateReason = cr.reason
+			return cr
+		}
+		if report.Err != nil {
+			// Preserve the query error in the health API as well as its reason;
+			// registration's own error only describes checkpoint failures.
+			cr.err = report.Err
+			cr.suggestedActions = fabric.SuggestedActions(report.Err, apiv1.HealthStateTypeUnhealthy)
+		}
 		if report.Reason != "" {
 			cr.FabricStateReason = report.Reason
+		}
+		health, reason, err := c.fabricRegistration.Evaluate(c.ctx, cr.ts, report.Pending, report.Failed || (!report.Healthy && !report.Pending))
+		if report.Pending || err != nil {
+			cr.health = health
+			cr.reason = reason + ": " + report.Reason
+			cr.err = errors.Join(report.Err, err)
+			cr.suggestedActions = fabric.SuggestedActions(errors.Join(report.Err, err), health)
+			return c.checkLocalFabricManager(cr, fmRequired, nonPCIFabric)
 		}
 
 		// GB200 NVL72 Fabric Management Architecture
@@ -425,6 +488,7 @@ func (c *component) Check() components.CheckResult {
 		// the traditional fabric-manager daemon.
 
 		if !report.Healthy {
+			cr.suggestedActions = fabric.SuggestedActions(report.Err, apiv1.HealthStateTypeUnhealthy)
 			log.Logger.Warnw("fabric state is not healthy", "reason", report.Reason, "error", report.Err)
 
 			cr.health = apiv1.HealthStateTypeUnhealthy
@@ -433,13 +497,37 @@ func (c *component) Check() components.CheckResult {
 			cr.health = apiv1.HealthStateTypeHealthy
 			cr.reason = c.nvmlInstance.ProductName() + " checked fabric state"
 		}
+
+		// NVIDIA's NVL72 post-reboot verification includes "Verify that the
+		// nvidia-imex service is active and running", because cross-node GPU
+		// memory mapping over NVLink needs IMEX on every node in the domain.
+		// https://docs.nvidia.com/dgx/dgxvr-user-guide/rack-reboot-sequence.html
+		// The same documentation says IMEX starts "during system startup or
+		// during the launch of the CUDA job", so a stopped daemon on an idle node
+		// is a valid state. Record it for operators instead of changing health.
+		// https://docs.nvidia.com/dgx/dgxvr-user-guide/software.html
+		if isRubin && externalFabric && !report.AllUnsupported && c.checkIMEXActiveFunc != nil {
+			if c.checkIMEXActiveFunc() {
+				cr.IMEXState = imexStateRunning
+			} else {
+				cr.IMEXState = imexStateNotRunning
+			}
+			cr.reason = appendReason(cr.reason, "nvidia-imex "+cr.IMEXState)
+		}
 	}
 
-	if !c.nvmlInstance.FabricManagerSupported() {
+	return c.checkLocalFabricManager(cr, fmRequired, nonPCIFabric)
+}
+
+// Check the applicable local service even while registration is pending, retaining
+// fabric health so a live daemon cannot hide an unavailable fabric.
+// fmRequired combines product support with fabric evidence gathered by Check.
+func (c *component) checkLocalFabricManager(cr *checkResult, fmRequired, nonPCIFabric bool) *checkResult {
+	if !fmRequired {
 		cr.FabricManagerActive = false
 
-		// Preserve unhealthy state from fabric state check, only set healthy if not already unhealthy
-		if cr.health != apiv1.HealthStateTypeUnhealthy {
+		// Preserve the independently observed fabric health.
+		if cr.health == "" {
 			cr.health = apiv1.HealthStateTypeHealthy
 		}
 		cr.reason = appendReason(cr.reason, c.nvmlInstance.ProductName()+" does not support fabric manager")
@@ -448,11 +536,11 @@ func (c *component) Check() components.CheckResult {
 		return cr
 	}
 
-	if c.checkNVSwitchExistsFunc != nil && !c.checkNVSwitchExistsFunc() {
+	if !nonPCIFabric && c.checkNVSwitchExistsFunc != nil && !c.checkNVSwitchExistsFunc() {
 		cr.FabricManagerActive = false
 
-		// Preserve unhealthy state from fabric state check, only set healthy if not already unhealthy
-		if cr.health != apiv1.HealthStateTypeUnhealthy {
+		// Preserve the independently observed fabric health.
+		if cr.health == "" {
 			cr.health = apiv1.HealthStateTypeHealthy
 		}
 		cr.reason = appendReason(cr.reason, "NVSwitch not detected, skipping fabric manager check")
@@ -464,10 +552,11 @@ func (c *component) Check() components.CheckResult {
 	if !c.checkFMExistsFunc() {
 		cr.FabricManagerActive = false
 
-		if cr.health == "" || cr.health == apiv1.HealthStateTypeHealthy {
-			cr.health = apiv1.HealthStateTypeUnhealthy
-		}
+		cr.health = apiv1.HealthStateTypeUnhealthy
 		cr.reason = appendReason(cr.reason, "fabric manager supported but nv-fabricmanager executable not found")
+		if cr.suggestedActions == nil {
+			cr.suggestedActions = fabric.SuggestedActions(nil, cr.health)
+		}
 
 		// no reason to proceed the fabric-manager activeness checks
 		return cr
@@ -487,7 +576,7 @@ func (c *component) Check() components.CheckResult {
 		// Ref: https://github.com/NVIDIA/gpu-operator/issues/610
 		if c.hasNothingToDoEvent() {
 			log.Logger.Infow("fabric manager reported nothing to do, treating as healthy")
-			if cr.health != apiv1.HealthStateTypeUnhealthy {
+			if cr.health == "" {
 				cr.health = apiv1.HealthStateTypeHealthy
 			}
 			cr.reason = appendReason(cr.reason, "fabric manager has nothing to do (no NVSwitch devices)")
@@ -498,13 +587,17 @@ func (c *component) Check() components.CheckResult {
 			cr.health = apiv1.HealthStateTypeUnhealthy
 		}
 		cr.reason = appendReason(cr.reason, "fabric manager found but not active")
+		if cr.suggestedActions == nil {
+			cr.suggestedActions = fabric.SuggestedActions(nil, cr.health)
+		}
 
 		return cr
 	}
 
 	cr.FabricManagerActive = true
 
-	if cr.health == apiv1.HealthStateTypeUnhealthy {
+	if cr.health != "" && cr.health != apiv1.HealthStateTypeHealthy {
+		cr.reason = appendReason(cr.reason, "fabric manager found and active")
 		return cr
 	}
 
@@ -553,12 +646,34 @@ func (c *component) hasNothingToDoEvent() bool {
 }
 
 // checkFMExists returns true if the fabric manager executable is found in the system.
+// In addition to PATH, it probes the well-known driver roots that the gpud
+// DaemonSet mounts by default: on GPU Operator-managed nodes the
+// nv-fabricmanager binary is installed under the Operator's driver tree
+// (/run/nvidia/driver/usr/bin) rather than on the host system paths, so a
+// PATH-only lookup reports a false "executable not found" (LEP-6440, verified
+// on GPU Operator-managed clusters (e.g. with GPU Operator 26.3.2): binary absent from
+// /host/usr/bin and /host/usr/sbin, present at
+// /run/nvidia/driver/usr/bin/nv-fabricmanager inside the same gpud pod that
+// reported it missing).
 func checkFMExists() bool {
 	p, err := exec.LookPath("nv-fabricmanager")
-	if err != nil {
-		return false
+	if err == nil && p != "" {
+		return true
 	}
-	return p != ""
+	return checkFMExistsInRoots(driverroot.Existing())
+}
+
+// checkFMExistsInRoots returns true if the nv-fabricmanager executable exists
+// under any of the given driver roots. It takes the roots as a parameter (so
+// tests can point the probe at temporary directories) and is a no-op when no
+// driver root is mounted, preserving the bare-metal/systemd behavior.
+func checkFMExistsInRoots(roots []string) bool {
+	for _, dir := range driverroot.BinDirs(roots...) {
+		if st, err := os.Stat(filepath.Join(dir, "nv-fabricmanager")); err == nil && !st.IsDir() {
+			return true
+		}
+	}
+	return false
 }
 
 // checkFMActive returns true if the traditional fabric manager is active by checking its listening port.
@@ -580,8 +695,55 @@ func checkFMExists() bool {
 // Alternative implementation: We could check dbus connection to see if the systemd
 // "nvidia-fabricmanager" service is active, but port checking is simpler and sufficient.
 func checkFMActive() bool {
-	return netutil.IsPortOpen(defaultFabricManagerPort)
+	if netutil.IsPortOpen(defaultFabricManagerPort) {
+		return true
+	}
+
+	// The port check alone is insufficient when the GPU Operator runs fabric
+	// manager inside its driver container: the FM process is alive (started by
+	// the driver DaemonSet with the nvswitch fabricmanager.cfg) but does not
+	// listen on port 6666 on the host (LEP-6440, verified on GPU Operator clusters:
+	// "nv-fabricmanager -c /usr/share/nvidia/nvswitch/fabricmanager.cfg" alive
+	// as host pid 39063, no :6666 listener in /proc/net/tcp, systemd unit
+	// nvidia-fabricmanager.service inactive). gpud's DaemonSet runs with
+	// hostPID, and on bare metal /proc is the host's, so scanning /proc covers
+	// both deployment modes.
+	return processRunning("/proc", "nv-fabricmanager")
 }
+
+// processRunning returns true if a process named name is found under the
+// given proc root ("/proc" in production; a temporary directory in tests).
+// It matches on the basename of argv[0], which is more precise than
+// /proc/<pid>/comm (comm is truncated to 15 bytes and would read
+// "nv-fabricmanage").
+func processRunning(procRoot, name string) bool {
+	entries, err := os.ReadDir(procRoot)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if _, err := strconv.Atoi(entry.Name()); err != nil {
+			continue
+		}
+		cmdline, err := os.ReadFile(filepath.Join(procRoot, entry.Name(), "cmdline"))
+		if err != nil || len(cmdline) == 0 {
+			continue
+		}
+		argv0 := strings.SplitN(string(cmdline), "\x00", 2)[0]
+		if filepath.Base(argv0) == name {
+			return true
+		}
+	}
+	return false
+}
+
+const (
+	imexStateRunning    = "running"
+	imexStateNotRunning = "not running"
+)
 
 var _ components.CheckResult = &checkResult{}
 
@@ -598,6 +760,9 @@ type checkResult struct {
 	FabricStates []device.FabricStateEntry `json:"fabric_states,omitempty"`
 	// FabricStateReason captures any aggregated fabric health warnings.
 	FabricStateReason string `json:"fabric_state_reason,omitempty"`
+	// IMEXState records whether nvidia-imex is running once a multi-node
+	// NVLink fabric is in use. Empty when IMEX is not applicable.
+	IMEXState string `json:"imex_state,omitempty"`
 
 	// timestamp of the last check
 	ts time.Time
@@ -676,12 +841,13 @@ func (cr *checkResult) HealthStates() apiv1.HealthStates {
 	}
 
 	state := apiv1.HealthState{
-		Time:      metav1.NewTime(cr.ts),
-		Component: Name,
-		Name:      Name,
-		Reason:    cr.reason,
-		Error:     cr.getError(),
-		Health:    cr.health,
+		Time:             metav1.NewTime(cr.ts),
+		Component:        Name,
+		Name:             Name,
+		Reason:           cr.reason,
+		Error:            cr.getError(),
+		Health:           cr.health,
+		SuggestedActions: cr.suggestedActions,
 	}
 
 	b, _ := json.Marshal(cr)

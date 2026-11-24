@@ -33,13 +33,56 @@ import (
 	pkgmachineinfo "github.com/leptonai/gpud/pkg/machine-info"
 	pkgmetadata "github.com/leptonai/gpud/pkg/metadata"
 	pkgnfschecker "github.com/leptonai/gpud/pkg/nfs-checker"
+	nvidianvml "github.com/leptonai/gpud/pkg/nvidia/nvml"
+	nvidiapci "github.com/leptonai/gpud/pkg/nvidia/pci"
 	gpudserver "github.com/leptonai/gpud/pkg/server"
 	pkgsqlite "github.com/leptonai/gpud/pkg/sqlite"
 	pkgsystemd "github.com/leptonai/gpud/pkg/systemd"
 	"github.com/leptonai/gpud/version"
 )
 
+var hasNVIDIAGPU = func() (bool, error) {
+	return nvidiapci.HasNVIDIAGPU(nvidiapci.DefaultSysfsPCIDevicesDir)
+}
+
+var newNVMLInstance = nvidianvml.New
+
+func requireNVIDIADriver() error {
+	hasGPU, err := hasNVIDIAGPU()
+	if err != nil {
+		return fmt.Errorf("failed to detect NVIDIA GPU devices: %w", err)
+	}
+	if !hasGPU {
+		return nil
+	}
+
+	instance, err := newNVMLInstance()
+	if err != nil {
+		return fmt.Errorf("NVIDIA GPU detected but the NVIDIA driver is not ready: %w", err)
+	}
+	defer func() {
+		if err := instance.Shutdown(); err != nil {
+			log.Logger.Debugw("failed to shut down pre-login NVML instance", "error", err)
+		}
+	}()
+
+	if !instance.NVMLExists() {
+		return fmt.Errorf("NVIDIA GPU detected but the NVIDIA NVML library is not loaded")
+	}
+	if err := instance.InitError(); err != nil {
+		return fmt.Errorf("NVIDIA GPU detected but the NVIDIA driver is not ready: %w", err)
+	}
+	return nil
+}
+
+var ensureNVIDIADriver = requireNVIDIADriver
+
 func Command(cliContext *cli.Context) error {
+	controlPlaneLoginRegistrationToken, err := common.ConsumeEnrollmentToken(cliContext)
+	if err != nil {
+		return err
+	}
+
 	logLevel := cliContext.String("log-level")
 	logFile := cliContext.String("log-file")
 	zapLvl, err := log.ParseLogLevel(logLevel)
@@ -49,6 +92,15 @@ func Command(cliContext *cli.Context) error {
 	log.SetLogger(log.CreateLogger(zapLvl, logFile))
 
 	log.Logger.Debugw("starting run command")
+	containerdConfig, err := containerdConfigFromCLI(cliContext)
+	if err != nil {
+		return err
+	}
+
+	containerdDanglingPodGracePeriod := cliContext.Duration("containerd-dangling-pod-grace-period")
+	if containerdDanglingPodGracePeriod < 0 {
+		return fmt.Errorf("containerd-dangling-pod-grace-period must not be negative")
+	}
 
 	dataDir, err := common.ResolveDataDir(cliContext)
 	if err != nil {
@@ -81,15 +133,16 @@ func Command(cliContext *cli.Context) error {
 	// Optional overrides for control plane connectivity
 	controlPlaneEndpoint := cliContext.String("endpoint")
 
-	// Represents the machine registration login token.
-	// This is the token that GPUd sends to the control plane to register the machine.
-	// This is NOT the token that GPUd uses for session authentication.
-	controlPlaneLoginRegistrationToken := cliContext.String("token")
-
 	machineIDForOverride := cliContext.String("machine-id")
 	shouldOverwriteMachineID := cliContext.Bool("machine-id-overwrite")
 	refreshSessionToken := cliContext.Bool("refresh-session-token")
 	controlPlaneLoginSucceeded := false
+
+	if cliContext.Bool("require-nvidia-driver") && (cliContext.IsSet("token") || controlPlaneLoginRegistrationToken != "") {
+		if err := ensureNVIDIADriver(); err != nil {
+			return err
+		}
+	}
 
 	// Note: login.Login() ALWAYS writes to the persistent state file (via dataDir),
 	// regardless of --db-in-memory flag. The login package doesn't know about in-memory mode.
@@ -109,7 +162,9 @@ func Command(cliContext *cli.Context) error {
 			RefreshSessionToken: refreshSessionToken,
 			DataDir:             dataDir,
 
-			GPUCount: gpuCountStr,
+			GPUCount:   gpuCountStr,
+			Region:     cliContext.String("region"),
+			Containerd: containerdConfig,
 		}
 
 		// on successful login, we persist the session token in the metadata for future re-use
@@ -366,18 +421,23 @@ func Command(cliContext *cli.Context) error {
 	cfg.BlockdevUsageCommands = blockdevUsageCommands
 	cfg.NFSHostRoot = nfsHostRoot
 	cfg.ContainerdServiceActiveCommands = containerdServiceActiveCommands
+	cfg.Containerd = containerdConfig
+	cfg.ContainerdDanglingPodGracePeriod = metav1.Duration{Duration: containerdDanglingPodGracePeriod}
 	if !versionFileSet {
 		versionFile = config.VersionFilePath(cfg.DataDir)
 	}
 	cfg.VersionFile = versionFile
 
 	cfg.PluginSpecsFile = pluginSpecsFile
+	cfg.PluginSpecsFileManaged = cliContext.Bool("plugin-specs-file-managed")
 	cfg.SkipSessionUpdateConfig = skipSessionUpdateConfig
 	cfg.SessionProtocol = sessionProtocol
 
 	if components != "" {
 		cfg.Components = strings.Split(components, ",")
 	}
+
+	applyNVSentinelEndpoint(cfg, cliContext.String("nvsentinel-endpoint"))
 
 	auditLogger := log.NewNopAuditLogger()
 	if logFile != "" {
@@ -448,6 +508,21 @@ func Command(cliContext *cli.Context) error {
 	<-done
 
 	return nil
+}
+
+// applyNVSentinelEndpoint enables the NVSentinel integration from the
+// --nvsentinel-endpoint CLI flag. An empty endpoint leaves the config
+// untouched so YAML configuration keeps working unchanged.
+func applyNVSentinelEndpoint(cfg *config.Config, endpoint string) {
+	if endpoint == "" {
+		return
+	}
+	if cfg.NVSentinel == nil {
+		cfg.NVSentinel = &config.NVSentinelConfig{}
+	}
+	cfg.NVSentinel.Enabled = true
+	cfg.NVSentinel.SocketPath = endpoint
+	log.Logger.Infow("nvsentinel integration enabled via --nvsentinel-endpoint", "socket", endpoint)
 }
 
 func validateMachineIDOverride(prevMachineID, requestedMachineID string, overwrite, controlPlaneLoginSucceeded bool) error {

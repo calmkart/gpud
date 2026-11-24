@@ -36,8 +36,9 @@ type Detail struct {
 	SuggestedActionsByGPUd *apiv1.SuggestedActions `json:"suggested_actions_by_gpud,omitempty"`
 
 	// EventType is the type of the event.
-	// The xid component health state is set to "Unhealthy"
-	// if this event type is "Critical" or "Fatal".
+	// The durable consumer maps Fatal to Unhealthy and Critical to Degraded.
+	// Scan maps non-154 Critical and Fatal to Unhealthy; XID 154 uses the
+	// durable recovery policy in both paths.
 	EventType apiv1.EventType `json:"event_type"`
 }
 
@@ -1932,17 +1933,31 @@ var details = map[int]Detail{
 			// NOTE: DeepSeek AI paper explains Xid 94 indicates GPU memory ECC error, recommending GPU reset for optimal performance.
 			// "Fire-Flyer AI-HPC: A Cost-Effective Software-Hardware Co-Design for Deep Learning", https://arxiv.org/abs/2408.14158v1 (Aug 2024)
 			//
-			// Xid 94, marked as critical in GPUd, indicates contained ECC errors with row-remapping successfully suppressing the errors. User applications can keep running, but the faulty application must be restarted. Stop the workloads and reset the GPU or reboot the system. This ensures retirement or remapping is permanently effective.",
-			// Xid 94, marked as critical in GPUd, indicates contained ECC errors with row-remapping successfully suppressing the errors. If the same Xid is reported again after rebooting the system, the GPU hardware should be inspected and repaired.
+			// Xid 94, ignored in GPUd, indicates a contained memory error: the driver contained the error to the application that encountered it.
+			// Other applications keep running, and dynamic page offlining keeps new allocations off the faulty page without a GPU reset.
+			// A workload can emit Xid 94 frequently without degradation, so rebooting the node for every Xid 94 drains healthy capacity.
+			//
+			// The NVIDIA catalog marks Xid 94 investigatory resolution as "IGNORE (sympathetic)": it accompanies the underlying memory error,
+			// which other signals report and which still drive repair in GPUd:
+			//   - Xid 48 (double bit ECC error): the uncorrectable error itself, Fatal with REBOOT_SYSTEM/HARDWARE_INSPECTION.
+			//   - Xid 63 (row remapping recording event): the faulty row was recorded in the InfoROM and takes effect after a GPU reset,
+			//     Fatal with REBOOT_SYSTEM/HARDWARE_INSPECTION.
+			//   - Xid 64 (row remapping recording failure): Fatal with REBOOT_SYSTEM/HARDWARE_INSPECTION.
+			//   - Xid 95 (uncontained memory error) and Xid 140 (unrecovered ECC error): containment failed, Fatal.
+			//   - Xid 160 (channel retirement event, select Blackwell GPUs): a DRAM channel or L2 slice is marked for repair after repeated
+			//     uncorrectable errors in a remapped bank. Currently a Warning without repair actions in GPUd.
+			//   - The remapped-rows component reads NVML row remapping state independently of kmsg: a pending remap suggests REBOOT_SYSTEM
+			//     and a failed remap suggests HARDWARE_INSPECTION. It only runs when the product name maps to row remapping support
+			//     (see pkg/nvidia/product.SupportedMemoryMgmtCapsByGPUProduct).
+			// "NVIDIA GPU Memory Error Management: User Visible Statistics", https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/latest/user-visible-statistics.html (accessed on Nov 3, 2026)
+			// "NVIDIA GPU Memory Error Management: RAS Repair", https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/latest/hbm-channel-repair.html (accessed on Nov 3, 2026)
 			RepairActions: []apiv1.RepairActionType{
-				apiv1.RepairActionTypeRebootSystem,
 				apiv1.RepairActionTypeIgnoreNoActionRequired,
 			},
 		},
 
-		// Xids whose GPUd.RepairActions is REBOOT_SYSTEM
-		// Xids whose GPUd.RepairActions is HARDWARE_INSPECTION
-		EventType: apiv1.EventTypeFatal,
+		// Xids whose GPUd.RepairActions is IGNORE_NO_ACTION_REQUIRED without REBOOT_SYSTEM/HARDWARE_INSPECTION
+		EventType: apiv1.EventTypeInfo,
 	},
 	95: {
 		Code:        95,

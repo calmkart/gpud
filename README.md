@@ -37,7 +37,21 @@ curl -fsSL https://pkg.gpud.dev/install.sh | sh
 To install the latest published version explicitly:
 
 ```bash
-curl -fsSL https://pkg.gpud.dev/install.sh | sh -s -- "$(curl -fsSL https://pkg.gpud.dev/unstable_latest.txt)"
+# latest stable release (recommended)
+curl -fsSL https://pkg.gpud.dev/install.sh | sh -s -- "$(curl -fsSL https://pkg.gpud.dev/stable_latest.txt)"
+
+# unstable_latest.txt tracks the most recently published stable (non-prerelease) tag:
+# curl -fsSL https://pkg.gpud.dev/install.sh | sh -s -- "$(curl -fsSL https://pkg.gpud.dev/unstable_latest.txt)"
+```
+
+The default installer reads `stable_latest.txt`. The legacy `unstable_latest.txt`
+pointer is also advanced only for stable tags that are neither drafts nor
+prereleases; it does not select the latest RC. RC packages remain available by their exact published version.
+To install one, replace the placeholder below with its published tag:
+
+```bash
+GPUD_VERSION="vX.Y.Z-rc.N" # replace with an existing RC tag
+curl -fsSL https://pkg.gpud.dev/install.sh | sh -s -- "$GPUD_VERSION"
 ```
 
 The install script supports Linux on amd64 and arm64.
@@ -123,7 +137,11 @@ Install or upgrade to the latest published release from GitHub Pages:
 helm repo add gpud https://leptonai.github.io/gpud
 helm repo update gpud
 
-GPUD_VERSION="$(curl -fsSL https://pkg.gpud.dev/unstable_latest.txt)"
+# latest stable release (recommended)
+# unstable_latest.txt tracks the most recently published stable tag, not the latest RC
+GPUD_VERSION="$(curl -fsSL https://pkg.gpud.dev/stable_latest.txt)"
+# To pin an RC, replace the value above with its published tag:
+# GPUD_VERSION="vX.Y.Z-rc.N"
 GPUD_VERSION="${GPUD_VERSION#v}"
 
 helm upgrade --install gpud gpud/gpud \
@@ -136,7 +154,12 @@ helm upgrade --install gpud gpud/gpud \
 Or pull the same chart from NGC:
 
 ```bash
-helm pull https://helm.ngc.nvidia.com/nvidia/lepton/charts/gpud-0.12.24.tgz
+# latest stable release (recommended)
+# unstable_latest.txt tracks the most recently published stable tag, not the latest RC
+GPUD_VERSION="$(curl -fsSL https://pkg.gpud.dev/stable_latest.txt)"
+# To pin an RC, replace the value above with its published tag:
+# GPUD_VERSION="vX.Y.Z-rc.N"
+helm pull "https://helm.ngc.nvidia.com/nvidia/lepton/charts/gpud-${GPUD_VERSION#v}.tgz"
 ```
 
 ### Build with Docker

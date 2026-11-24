@@ -7,6 +7,7 @@ import (
 	"os"
 	"time"
 
+	nvlibdevice "github.com/NVIDIA/go-nvlib/pkg/nvlib/device"
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
 
 	"github.com/leptonai/gpud/pkg/log"
@@ -57,8 +58,8 @@ type Instance interface {
 	ProductName() string
 
 	// Architecture returns the architecture of the GPU.
-	// GB200 may return "NVIDIA-Graphics-Device" for the product name
-	// but "blackwell" for architecture.
+	// Early drivers may report "NVIDIA-Graphics-Device" as the product name;
+	// architecture identification does not depend on that name.
 	Architecture() string
 
 	// Brand returns the brand of the GPU.
@@ -82,6 +83,10 @@ type Instance interface {
 
 	// GetMemoryErrorManagementCapabilities returns the memory error management capabilities of the GPU.
 	GetMemoryErrorManagementCapabilities() nvidiaproduct.MemoryErrorManagementCapabilities
+
+	// Capabilities returns the resolved product, architecture and host-link
+	// capabilities, including external-fabric candidacy from measured C2C.
+	Capabilities() nvidiaproduct.Capabilities
 
 	// Shutdown shuts down the NVML library.
 	Shutdown() error
@@ -205,16 +210,18 @@ func newInstance(refreshCtx context.Context, refreshNVML func(context.Context), 
 	log.Logger.Debugw("got devices from device library", "numDevices", len(devices))
 
 	productName := ""
+	productNameInferred := false
 	archFamily := ""
 	brand := ""
 
 	devs := make(map[string]device.Device)
 	if len(devices) > 0 {
-		name, ret := devices[0].GetName()
-		if ret != nvml.SUCCESS {
-			return nil, fmt.Errorf("failed to get device name: %v", nvml.ErrorString(ret))
+		name, inferred, err := getProductName(devices[0])
+		if err != nil {
+			return nil, err
 		}
 		productName = name
+		productNameInferred = inferred
 		log.Logger.Debugw("detected product name", "productName", productName)
 
 		// Apply product name override for testing if configured
@@ -225,6 +232,7 @@ func newInstance(refreshCtx context.Context, refreshNVML func(context.Context), 
 				"original", productName,
 				"override", failureInjector.GPUProductNameOverride)
 			productName = failureInjector.GPUProductNameOverride
+			productNameInferred = false
 		}
 
 		for _, dev := range devices {
@@ -239,6 +247,15 @@ func newInstance(refreshCtx context.Context, refreshNVML func(context.Context), 
 
 			// Build device options based on driver version and failure injector
 			var opts []device.OpOption
+			archFamily, err = GetArchFamily(dev)
+			if err != nil {
+				return nil, err
+			}
+			effectiveArch := archFamily
+			if failureInjector != nil && failureInjector.GPUProductNameOverride != "" {
+				effectiveArch = ""
+			}
+			opts = append(opts, device.WithRubin(nvidiaproduct.IsRubin(productName, effectiveArch)))
 
 			// Always pass driver major version so devices can gate V3 fabric API calls.
 			// nvmlDeviceGetGpuFabricInfoV requires driver >= 550; calling it on older
@@ -272,13 +289,7 @@ func newInstance(refreshCtx context.Context, refreshNVML func(context.Context), 
 			devs[uuid] = device.New(dev, busID, opts...)
 		}
 
-		var err error
 		for _, dev := range devs {
-			archFamily, err = GetArchFamily(dev)
-			if err != nil {
-				return nil, err
-			}
-
 			brand, err = GetBrand(dev)
 			if err != nil {
 				return nil, err
@@ -286,9 +297,23 @@ func newInstance(refreshCtx context.Context, refreshNVML func(context.Context), 
 		}
 	}
 
-	fmSupported := nvidiaproduct.SupportedFMByGPUProduct(productName)
-	fabricStateSupported := nvidiaproduct.SupportFabricStateByGPUProduct(productName)
-	memMgmtCaps := nvidiaproduct.SupportedMemoryMgmtCapsByGPUProduct(productName)
+	capabilityArch := archFamily
+	hostLink := nvidiaproduct.HostLinkUnknown
+	if failureInjector != nil && failureInjector.GPUProductNameOverride != "" {
+		// An override simulates another product; real architecture or host-link
+		// evidence would otherwise outrank the simulated name.
+		capabilityArch = ""
+	} else if nvidiaproduct.IsRubin(productName, capabilityArch) {
+		for _, dev := range devices {
+			if hostLink = detectHostLink(nvmlLib, dev); hostLink != nvidiaproduct.HostLinkUnknown {
+				break
+			}
+		}
+	}
+	caps := nvidiaproduct.CapabilitiesForGPU(productName, capabilityArch, hostLink)
+	if productNameInferred {
+		caps.ExplicitNVL72 = false
+	}
 
 	return &instance{
 		nvmlLib:              nvmlLib,
@@ -301,10 +326,35 @@ func newInstance(refreshCtx context.Context, refreshNVML func(context.Context), 
 		sanitizedProductName: nvidiaproduct.SanitizeProductName(productName),
 		architecture:         archFamily,
 		brand:                brand,
-		fabricMgrSupported:   fmSupported,
-		fabricStateSupported: fabricStateSupported,
-		memMgmtCaps:          memMgmtCaps,
+		caps:                 caps,
 	}, nil
+}
+
+// detectHostLink recognizes enabled NVLink-C2C. A disabled link does not prove
+// an x86 host or local NVSwitch ownership.
+// The caller tries Rubin devices until one reports enabled C2C. Unavailable
+// or disabled mode leaves topology unknown and permits trying the next device.
+func detectHostLink(lib nvmllib.Library, dev nvlibdevice.Device) nvidiaproduct.HostLink {
+	// go-nvml binds this symbol directly. Older drivers lack it, and calling a
+	// missing symbol terminates the process during lazy linking.
+	if lib.NVML().Extensions().LookupSymbol("nvmlDeviceGetC2cModeInfoV") != nil {
+		return nvidiaproduct.HostLinkUnknown
+	}
+	// The go-nvml handler always calls into the C library, so mocks cannot
+	// drive it directly without patching; hostLinkFromC2CMode classifies the result.
+	return hostLinkFromC2CMode(dev.GetC2cModeInfoV().V1())
+}
+
+func hostLinkFromC2CMode(info nvml.C2cModeInfo_v1, ret nvml.Return) nvidiaproduct.HostLink {
+	switch {
+	case ret == nvml.SUCCESS && info.IsC2cEnabled != 0:
+		return nvidiaproduct.HostLinkC2C
+	default:
+		// An unsupported query is not a successful disabled-mode result.
+		// Keep topology unknown so another GPU or an explicit name can resolve it.
+		// https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlDeviceQueries.html
+		return nvidiaproduct.HostLinkUnknown
+	}
 }
 
 var _ Instance = &instance{}
@@ -325,9 +375,7 @@ type instance struct {
 	architecture         string
 	brand                string
 
-	fabricMgrSupported   bool
-	fabricStateSupported bool
-	memMgmtCaps          nvidiaproduct.MemoryErrorManagementCapabilities
+	caps nvidiaproduct.Capabilities
 }
 
 func (inst *instance) NVMLExists() bool {
@@ -367,15 +415,19 @@ func (inst *instance) CUDAVersion() string {
 }
 
 func (inst *instance) FabricManagerSupported() bool {
-	return inst.fabricMgrSupported
+	return inst.caps.FabricManager
 }
 
 func (inst *instance) FabricStateSupported() bool {
-	return inst.fabricStateSupported
+	return inst.caps.FabricState
 }
 
 func (inst *instance) GetMemoryErrorManagementCapabilities() nvidiaproduct.MemoryErrorManagementCapabilities {
-	return inst.memMgmtCaps
+	return inst.caps.MemoryManagement
+}
+
+func (inst *instance) Capabilities() nvidiaproduct.Capabilities {
+	return inst.caps
 }
 
 func (inst *instance) Shutdown() error {
@@ -409,6 +461,9 @@ func (inst *noOpInstance) FabricManagerSupported() bool      { return false }
 func (inst *noOpInstance) FabricStateSupported() bool        { return false }
 func (inst *noOpInstance) GetMemoryErrorManagementCapabilities() nvidiaproduct.MemoryErrorManagementCapabilities {
 	return nvidiaproduct.MemoryErrorManagementCapabilities{}
+}
+func (inst *noOpInstance) Capabilities() nvidiaproduct.Capabilities {
+	return nvidiaproduct.Capabilities{}
 }
 func (inst *noOpInstance) Shutdown() error  { return nil }
 func (inst *noOpInstance) InitError() error { return nil }
@@ -445,6 +500,9 @@ func (inst *erroredInstance) FabricManagerSupported() bool      { return false }
 func (inst *erroredInstance) FabricStateSupported() bool        { return false }
 func (inst *erroredInstance) GetMemoryErrorManagementCapabilities() nvidiaproduct.MemoryErrorManagementCapabilities {
 	return nvidiaproduct.MemoryErrorManagementCapabilities{}
+}
+func (inst *erroredInstance) Capabilities() nvidiaproduct.Capabilities {
+	return nvidiaproduct.Capabilities{}
 }
 func (inst *erroredInstance) Shutdown() error  { return nil }
 func (inst *erroredInstance) InitError() error { return inst.initErr }

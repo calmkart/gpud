@@ -4,10 +4,36 @@ import (
 	"flag"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/urfave/cli"
 )
+
+func TestAppRunContainerdFlags(t *testing.T) {
+	app := App()
+	for _, cmd := range app.Commands {
+		if cmd.Name != "run" {
+			continue
+		}
+		set := flag.NewFlagSet("run", flag.ContinueOnError)
+		for _, f := range cmd.Flags {
+			f.Apply(set)
+		}
+		for _, name := range []string{"containerd-endpoint", "containerd-config-path", "containerd-service-name", "containerd-systemctl-commands"} {
+			require.NotNil(t, set.Lookup(name))
+			require.Empty(t, set.Lookup(name).DefValue)
+		}
+		ctx := cli.NewContext(app, set, nil)
+		require.Zero(t, ctx.Duration("containerd-dangling-pod-grace-period"))
+		require.NoError(t, set.Set("containerd-dangling-pod-grace-period", "10m"))
+		require.Equal(t, 10*time.Minute, ctx.Duration("containerd-dangling-pod-grace-period"))
+		require.Error(t, set.Set("containerd-dangling-pod-grace-period", "invalid"))
+		require.NoError(t, set.Parse([]string{"--containerd-endpoint=unix:///run/k3s/containerd/containerd.sock", "--containerd-service-name=rke2-agent"}))
+		return
+	}
+	t.Fatal("run command missing")
+}
 
 func TestAppRunAndUpHaveSessionProtocolFlag(t *testing.T) {
 	t.Parallel()
@@ -72,6 +98,41 @@ func TestAppRunAndUpRefreshSessionTokenDefaultsToFalse(t *testing.T) {
 		require.NoError(t, set.Parse([]string{"--refresh-session-token"}))
 		ctx = cli.NewContext(app, set, nil)
 		require.True(t, ctx.Bool("refresh-session-token"))
+	}
+
+	for cmdName, found := range wantCommands {
+		require.Truef(t, found, "expected command %q to exist", cmdName)
+	}
+}
+
+func TestAppRunAndUpHaveRegionFlag(t *testing.T) {
+	t.Parallel()
+
+	app := App()
+	wantCommands := map[string]bool{"run": false, "up": false}
+	for _, cmd := range app.Commands {
+		if _, ok := wantCommands[cmd.Name]; !ok {
+			continue
+		}
+		wantCommands[cmd.Name] = true
+
+		var regionFlag cli.Flag
+		for _, candidate := range cmd.Flags {
+			if candidate.GetName() == "region" {
+				regionFlag = candidate
+				break
+			}
+		}
+		require.NotNilf(t, regionFlag, "command %q is missing --region", cmd.Name)
+
+		set := flag.NewFlagSet(cmd.Name, flag.ContinueOnError)
+		regionFlag.Apply(set)
+		ctx := cli.NewContext(app, set, nil)
+		require.Empty(t, ctx.String("region"))
+
+		require.NoError(t, set.Parse([]string{"--region", "eu-north-1"}))
+		ctx = cli.NewContext(app, set, nil)
+		require.Equal(t, "eu-north-1", ctx.String("region"))
 	}
 
 	for cmdName, found := range wantCommands {

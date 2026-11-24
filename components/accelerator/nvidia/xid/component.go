@@ -29,6 +29,7 @@ import (
 	"github.com/leptonai/gpud/pkg/log"
 	nvidianvml "github.com/leptonai/gpud/pkg/nvidia/nvml"
 	"github.com/leptonai/gpud/pkg/nvidia/nvml/device"
+	"github.com/leptonai/gpud/pkg/nvsentinel"
 )
 
 // Name is the name of the XID component.
@@ -66,13 +67,22 @@ type component struct {
 	kmsgWatcher      kmsg.Watcher
 
 	readAllKmsg  func(context.Context) ([]kmsg.Message, error)
-	extraEventCh chan *eventstore.Event
+	extraEventCh chan pendingEvent
 
 	lastMu          sync.RWMutex
 	lastCheckResult *checkResult
 
 	mu        sync.RWMutex
 	currState apiv1.HealthState
+
+	// nvsSource is the optional NVSentinel event source. When set, the
+	// component prefers NVSentinel Xid data points and suppresses its own
+	// kmsg detection of the same data point, except for XID 154, which uses
+	// the native stream while it is running to preserve kernel ordering.
+	nvsSource      nvsentinel.Source
+	nvsDedupWindow time.Duration
+	nvsUnsubscribe func()
+	// ^ stop function returned by nvsSource.Subscribe
 }
 
 // New returns the NVIDIA XID component.
@@ -89,7 +99,7 @@ func New(gpudInstance *components.GPUdInstance) (components.Component, error) {
 		getThresholdFunc: GetDefaultThresholds,
 
 		rebootEventStore: gpudInstance.RebootEventStore,
-		extraEventCh:     make(chan *eventstore.Event, 256),
+		extraEventCh:     make(chan pendingEvent, 256),
 	}
 
 	if gpudInstance.NVMLInstance != nil {
@@ -105,7 +115,7 @@ func New(gpudInstance *components.GPUdInstance) (components.Component, error) {
 		}
 
 		if os.Geteuid() == 0 {
-			c.kmsgWatcher, err = kmsg.NewWatcher()
+			c.kmsgWatcher, err = kmsg.NewWatcher(kmsg.WithExactDedupMatch(isRecoveryMessage))
 			if err != nil {
 				ccancel()
 				return nil, err
@@ -114,7 +124,18 @@ func New(gpudInstance *components.GPUdInstance) (components.Component, error) {
 	}
 
 	if runtime.GOOS == "linux" && os.Geteuid() == 0 {
-		c.readAllKmsg = kmsg.ReadAll
+		c.readAllKmsg = func(ctx context.Context) ([]kmsg.Message, error) {
+			return kmsg.ReadAllWithOptions(ctx, kmsg.WithExactDedupMatch(isRecoveryMessage))
+		}
+	}
+
+	if gpudInstance.NVSentinel != nil && c.eventBucket != nil {
+		c.nvsSource = gpudInstance.NVSentinel
+		c.nvsDedupWindow = gpudInstance.NVSentinelEventDedupWindow
+		if c.nvsDedupWindow <= 0 {
+			c.nvsDedupWindow = nvsentinel.DefaultEventDedupWindow
+		}
+		c.watchNVSentinel()
 	}
 
 	return c, nil
@@ -158,10 +179,19 @@ func (c *component) Start() error {
 		}
 	}
 
-	if c.kmsgWatcher != nil {
-		kmsgCh, err := c.kmsgWatcher.Watch()
-		if err != nil {
-			return err
+	// Run the event loop whenever any event source exists: the kmsg watcher
+	// (root with /dev/kmsg) or the NVSentinel receiver. NVSentinel's syslog
+	// health monitor may be the only kmsg reader on a node; without this,
+	// NVSentinel events would queue in extraEventCh and never be stored.
+	// A nil kmsgCh is never ready in start's select, which is fine.
+	if c.kmsgWatcher != nil || c.nvsSource != nil {
+		var kmsgCh <-chan kmsg.Message
+		if c.kmsgWatcher != nil {
+			ch, err := c.kmsgWatcher.Watch()
+			if err != nil {
+				return err
+			}
+			kmsgCh = ch
 		}
 		go c.start(kmsgCh, DefaultStateUpdatePeriod)
 	}
@@ -197,6 +227,10 @@ func (c *component) Close() error {
 	log.Logger.Debugw("closing component")
 
 	c.cancel()
+
+	if c.nvsUnsubscribe != nil {
+		c.nvsUnsubscribe()
+	}
 
 	if c.kmsgWatcher != nil {
 		cerr := c.kmsgWatcher.Close()
@@ -277,17 +311,8 @@ func (c *component) Check() components.CheckResult {
 			continue
 		}
 
-		// row remapping pending/failure (Xid 63/64)
-		// can also be detected by NVML API (vs. kmsg scanning)
-		// thus we discard Xid 63/64 in favor of row remapping checks
-		// especially, NVIDIA row remapping pending can happen >3 times
-		// which warrants system reboots, before reaching its row remapping
-		// failures threshold which requires hardware inspection
-		// in other words, we do not want to blindly suggest hw inspection
-		// from Xid 63/64, while row remmaping pending may self-resolve
-		// after >3 times of system reboots
-		// this is why we here discard Xid 63/64 in favor of row remapping checks
-		if c.nvmlInstance.GetMemoryErrorManagementCapabilities().RowRemapping && (xidErr.Xid == 63 || xidErr.Xid == 64) {
+		// Delegate only events covered by this GPU's row-remapping telemetry.
+		if c.rowRemappingOwnsXid(uint64(xidErr.Xid)) {
 			log.Logger.Warnw("discarding Xid 63/64 in favor of remapped-rows component", "xid", xidErr.Xid, "deviceUUID", xidErr.DeviceUUID)
 			continue
 		}
@@ -300,14 +325,44 @@ func (c *component) Check() components.CheckResult {
 
 	cr.reason = fmt.Sprintf("matched %d xid errors from %d kmsg(s)", len(cr.FoundErrors), len(kmsgs))
 
-	// only used for "gpud scan"
-	// if there are any critical errors, the health state will be unhealthy
-	cr.health = apiv1.HealthStateTypeHealthy
+	// Scan shares XID 154 recovery ownership with the durable consumer, while
+	// retaining its existing non-154 Critical/Fatal => Unhealthy policy.
+	var scanEvents eventstore.Events
+	nonRecoveryUnhealthy := false
 	for _, foundErr := range cr.FoundErrors {
-		if foundErr.Detail != nil && (foundErr.Detail.EventType == apiv1.EventTypeCritical || foundErr.Detail.EventType == apiv1.EventTypeFatal) {
-			cr.health = apiv1.HealthStateTypeUnhealthy
-			break
+		xidValue, ok := uint64FromInt(foundErr.Xid)
+		if !ok {
+			continue
 		}
+		payload := xidErrorEventDetail{
+			DeviceUUID:     foundErr.DeviceUUID,
+			Xid:            xidValue,
+			RecoveryAction: foundErr.RecoveryAction,
+		}
+		if foundErr.Detail != nil {
+			payload.Description = foundErr.Detail.Description
+			payload.SubCode = foundErr.Detail.SubCode
+			payload.ErrorStatus = foundErr.Detail.ErrorStatus
+			payload.SuggestedActionsByGPUd = foundErr.Detail.SuggestedActionsByGPUd
+		}
+		raw, _ := json.Marshal(payload)
+		event := eventstore.Event{Time: foundErr.Kmsg.Timestamp.Time, Name: EventNameErrorXid, ExtraInfo: map[string]string{EventKeyErrorXidData: string(raw)}}
+		if foundErr.Detail != nil {
+			if foundErr.Xid != 154 && (foundErr.Detail.EventType == apiv1.EventTypeCritical || foundErr.Detail.EventType == apiv1.EventTypeFatal) {
+				nonRecoveryUnhealthy = true
+			}
+			event.Type = string(foundErr.Detail.EventType)
+		}
+		scanEvents = append(scanEvents, event)
+	}
+	state := evolveHealthyState(mergeEvents(nil, scanEvents), c.devices, GetDefaultRebootThreshold())
+	cr.health = state.Health
+	if nonRecoveryUnhealthy {
+		cr.health = apiv1.HealthStateTypeUnhealthy
+	}
+	cr.suggestedActions = state.SuggestedActions
+	if len(scanEvents) > 0 {
+		cr.reason += "; " + state.Reason
 	}
 
 	return cr
@@ -427,12 +482,13 @@ func (cr *checkResult) HealthStates() apiv1.HealthStates {
 	}
 
 	state := apiv1.HealthState{
-		Time:      metav1.NewTime(cr.ts),
-		Component: Name,
-		Name:      Name,
-		Reason:    cr.reason,
-		Error:     cr.getError(),
-		Health:    cr.health,
+		Time:             metav1.NewTime(cr.ts),
+		Component:        Name,
+		Name:             Name,
+		Reason:           cr.reason,
+		Error:            cr.getError(),
+		Health:           cr.health,
+		SuggestedActions: cr.suggestedActions,
 	}
 	return apiv1.HealthStates{state}
 }
@@ -451,38 +507,61 @@ func (c *component) start(kmsgCh <-chan kmsg.Message, updatePeriod time.Duration
 				continue
 			}
 
-		case newEvent := <-c.extraEventCh:
-			if newEvent == nil {
+		case pending := <-c.extraEventCh:
+			if pending.event == nil {
 				continue
 			}
-			if err := c.eventBucket.Insert(c.ctx, *newEvent); err != nil {
+			recoveryFromNVSentinel := pending.nvsEvent != nil && pending.xid == 154
+			// NVSentinel replays journal batches using processing timestamps.
+			// Prefer the native stream, including over copies queued before Start.
+			if recoveryFromNVSentinel && kmsgCh != nil {
+				continue
+			}
+			if err := c.eventBucket.Insert(c.ctx, *pending.event); err != nil {
 				log.Logger.Errorw("failed to create event", "error", err)
 				continue
+			}
+			if recoveryFromNVSentinel {
+				metricXIDErrs.With(prometheus.Labels{
+					"uuid": convertBusIDToUUID(pending.event.ExtraInfo[EventKeyDeviceUUID], c.devices),
+					"xid":  "154",
+				}).Inc()
+			}
+			// Coverage is reported only after the insert succeeds: a failed
+			// insert must never suppress native detection of this incident.
+			if pending.nvsEvent != nil && c.nvsSource != nil {
+				c.nvsSource.RecordCoverage(*pending.nvsEvent)
 			}
 			if err := c.updateCurrentState(); err != nil {
 				log.Logger.Errorw("failed to update current state", "error", err)
 				continue
 			}
 
-		case message := <-kmsgCh:
+		case message, ok := <-kmsgCh:
+			if !ok {
+				// Resume NVSentinel delivery if the native reader exits.
+				kmsgCh = nil
+				continue
+			}
 			xidErr := Match(message.Message)
 			if xidErr == nil {
 				log.Logger.Debugw("not xid event, skip", "kmsg", message)
 				continue
 			}
 
-			// row remapping pending/failure (Xid 63/64)
-			// can also be detected by NVML API (vs. kmsg scanning)
-			// thus we discard Xid 63/64 in favor of row remapping checks
-			// especially, NVIDIA row remapping pending can happen >3 times
-			// which warrants system reboots, before reaching its row remapping
-			// failures threshold which requires hardware inspection
-			// in other words, we do not want to blindly suggest hw inspection
-			// from Xid 63/64, while row remmaping pending may self-resolve
-			// after >3 times of system reboots
-			// this is why we here discard Xid 63/64 in favor of row remapping checks
-			if c.nvmlInstance.GetMemoryErrorManagementCapabilities().RowRemapping && (xidErr.Xid == 63 || xidErr.Xid == 64) {
+			// Apply the same ownership as synchronous checks and event replay.
+			if c.rowRemappingOwnsXid(uint64(xidErr.Xid)) {
 				log.Logger.Warnw("discarding Xid 63/64 in favor of remapped-rows component", "xid", xidErr.Xid, "deviceUUID", xidErr.DeviceUUID)
+				continue
+			}
+
+			// When NVSentinel already reported this incident, skip the
+			// GPUd-native copy. Both detectors read the same kernel report.
+			// Storing both copies would double-count the same incident in
+			// thresholds.
+			if c.nvsentinelCoversXid(xidErr) {
+				log.Logger.Infow("nvsentinel covers this xid data point, skipping gpud-native insert",
+					"xid", xidErr.Xid, "deviceUUID", xidErr.DeviceUUID)
 				continue
 			}
 
@@ -501,10 +580,11 @@ func (c *component) start(kmsgCh <-chan kmsg.Message, updatePeriod time.Duration
 			}
 
 			xidPayload := xidErrorEventDetail{
-				Time:       metav1.NewTime(message.Timestamp.Time),
-				DataSource: "kmsg",
-				DeviceUUID: xidErr.DeviceUUID,
-				Xid:        xidValue,
+				Time:           metav1.NewTime(message.Timestamp.Time),
+				DataSource:     "kmsg",
+				DeviceUUID:     xidErr.DeviceUUID,
+				Xid:            xidValue,
+				RecoveryAction: xidErr.RecoveryAction,
 			}
 			if xidErr.Detail != nil {
 				xidPayload.SubCode = xidErr.Detail.SubCode
@@ -526,6 +606,12 @@ func (c *component) start(kmsgCh <-chan kmsg.Message, updatePeriod time.Duration
 				ExtraInfo: map[string]string{
 					EventKeyDeviceUUID: xidErr.DeviceUUID,
 				},
+			}
+			if xidErr.Xid == 154 {
+				// Keep producer precision and identity through SQLite's seconds-only
+				// timestamp column, including repeated transitions within a second.
+				event.ExtraInfo[eventKeyRecoveryTimestamp] = message.Timestamp.Format(time.RFC3339Nano)
+				event.ExtraInfo[eventKeyKmsgSequence] = strconv.Itoa(message.SequenceNumber)
 			}
 			// IMPORTANT: Set event.Type from Match() result to preserve precise unit-based severity.
 			//
@@ -603,6 +689,7 @@ func (c *component) updateCurrentState() error {
 	}
 	localEvents = trimEventsAfterSetHealthy(localEvents)
 	events := mergeEvents(rebootEvents, localEvents)
+	events = c.eventsForHealth(events)
 
 	c.mu.Lock()
 	c.currState = evolveHealthyStateWithThresholds(events, c.devices, rebootThreshold, thresholds)
@@ -614,6 +701,41 @@ func (c *component) updateCurrentState() error {
 	return nil
 }
 
+// rowRemappingOwnsXid limits delegation to failures covered by row telemetry.
+func (c *component) rowRemappingOwnsXid(code uint64) bool {
+	if c.nvmlInstance == nil || !c.nvmlInstance.GetMemoryErrorManagementCapabilities().RowRemapping {
+		return false
+	}
+	// Keep memory recovery owned by the memory component for every family.
+	// Rubin bank/channel recovery needs hardware qualification before Xid 64
+	// alone can introduce a new reboot or hardware-inspection escalation policy.
+	return code == 63 || code == 64
+}
+
+// eventsForHealth applies the same ownership as live ingestion to stored events.
+// Stored events remain available for diagnostics.
+func (c *component) eventsForHealth(events eventstore.Events) eventstore.Events {
+	if c.nvmlInstance == nil || !c.nvmlInstance.GetMemoryErrorManagementCapabilities().RowRemapping {
+		return events
+	}
+	filtered := make(eventstore.Events, 0, len(events))
+	for _, event := range events {
+		if event.Name == EventNameErrorXid {
+			raw := event.ExtraInfo[EventKeyErrorXidData]
+			var detail xidErrorEventDetail
+			if err := json.Unmarshal([]byte(raw), &detail); err != nil {
+				// Older stores encode only the numeric Xid.
+				detail.Xid, _ = strconv.ParseUint(raw, 10, 64)
+			}
+			if c.rowRemappingOwnsXid(detail.Xid) {
+				continue
+			}
+		}
+		filtered = append(filtered, event)
+	}
+	return filtered
+}
+
 // mergeEvents merges two event slices and returns a time descending sorted new slice
 func mergeEvents(a, b eventstore.Events) eventstore.Events {
 	totalLen := len(a) + len(b)
@@ -623,8 +745,15 @@ func mergeEvents(a, b eventstore.Events) eventstore.Events {
 	result := make(eventstore.Events, 0, totalLen)
 	result = append(result, a...)
 	result = append(result, b...)
+	for i := range result {
+		if raw := result[i].ExtraInfo[eventKeyRecoveryTimestamp]; raw != "" {
+			if ts, err := time.Parse(time.RFC3339Nano, raw); err == nil && ts.Unix() == result[i].Time.Unix() {
+				result[i].Time = ts
+			}
+		}
+	}
 
-	sort.Slice(result, func(i, j int) bool {
+	sort.SliceStable(result, func(i, j int) bool {
 		return result[i].Time.After(result[j].Time)
 	})
 
